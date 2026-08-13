@@ -216,10 +216,9 @@ def _render_store(ctx, b, v) -> str:
   return f"{ctx[b]} = {ctx[v]};"
 
 class MGLRenderer(CStyleLanguage):
-  has_local = False
   supports_float4 = False
-  global_max = (2147483646, 65535, 65535)
-  local_max = (1024, 1024, 1024)
+  global_max = (65535, 65535, 65535)
+  local_max = (1024, 1024, 64)
   code_for_workitem = {"g": lambda x: f"int(gl_WorkGroupID.{'xyz'[int(x)]})", "l": lambda x: f"int(gl_LocalInvocationID.{'xyz'[int(x)]})",
                        "i": lambda x: f"int(gl_GlobalInvocationID.{'xyz'[int(x)]})"}
   type_map = { dtypes.float: "float", dtypes.int32: "int", dtypes.uint32: "uint", dtypes.bool: "bool",

@@ -1,7 +1,7 @@
-import moderngl, struct
+import os, moderngl, struct
 from tinygrad.device import Compiled, Allocator, BufferSpec, Program, TinyELF
 from tinygrad.renderer.glsl import MGLRenderer
-from tinygrad.helpers import round_up, getenv
+from tinygrad.helpers import round_up
 
 MGLBuf = moderngl.Buffer | tuple[moderngl.Buffer, int]
 
@@ -24,7 +24,8 @@ class MGLProgram(Program['MGLDevice']):
       n_alu = len(vals)
       self.alu_dtypes = self.alu_dtypes[-n_alu:] if len(self.alu_dtypes) >= n_alu else self.alu_dtypes
       if self.ubo is None or self.ubo.size < 4*n_alu: self.ubo = self.dev.ctx.buffer(reserve=4*n_alu)
-      fmt = "<" + "".join("i" if dt.name == "int" else "I" if dt.name == "unsigned int" else "f" if dt.name == "float" else "i" for dt in self.alu_dtypes)
+      fmt = "<" + "".join("i" if dt.name == "int" else "I" if dt.name == "unsigned int" else
+                          "f" if dt.name == "float" else "i" for dt in self.alu_dtypes)
       self.ubo.write(struct.pack(fmt, *vals))
       self.ubo.bind_to_uniform_block(0)
     self.dev.ctx.memory_barrier(moderngl.SHADER_STORAGE_BARRIER_BIT | moderngl.BUFFER_UPDATE_BARRIER_BIT)
@@ -62,7 +63,7 @@ class MGLAllocator(Allocator['MGLDevice']):
 
 class MGLDevice(Compiled):
   def __init__(self, device:str):
-    self.ctx = moderngl.create_standalone_context(backend=getenv("MGL_BACKEND", "egl"), require=430)
+    self.ctx = moderngl.create_standalone_context(backend=os.getenv("MGL_BACKEND", "egl"), require=430)  # type: ignore[arg-type]
     super().__init__(device, MGLAllocator(self), [MGLRenderer], MGLProgram, arch="gl430")
 
   def synchronize(self): self.ctx.finish()
@@ -70,11 +71,11 @@ class MGLDevice(Compiled):
 # radeonsi (Mesa 26.1) miscompiles winograd conv kernels, so skip the winograd path on MGL and
 # always build the direct conv graph (correct, just not as fast). confined to this backend module.
 from tinygrad.device import Device
-from tinygrad.helpers import Context, WINO
+from tinygrad.helpers import Context
 from tinygrad.mixin.op import OpMixin
 _conv2d_orig = OpMixin.conv2d
 def _conv2d_mgl(self, weight, bias=None, groups=1, stride=1, dilation=1, padding=0, dtype=None):
   if Device.DEFAULT.startswith("MGL"):
     with Context(WINO=0): return _conv2d_orig(self, weight, bias, groups, stride, dilation, padding, dtype)
   return _conv2d_orig(self, weight, bias, groups, stride, dilation, padding, dtype)
-OpMixin.conv2d = _conv2d_mgl
+setattr(OpMixin, "conv2d", _conv2d_mgl)

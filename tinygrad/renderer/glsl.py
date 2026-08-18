@@ -55,6 +55,7 @@ def _is_complex_float(inner:str) -> bool:
     elif c == ')': depth -= 1
     elif c == '[': bdepth += 1
     elif c == ']': bdepth -= 1
+    elif c == ',' and depth == 0 and bdepth == 0: return False
     elif c in '+-*/' and depth == 0 and bdepth == 0: return True
   return False
 
@@ -65,6 +66,7 @@ def _has_top_mul(inner:str) -> bool:
     elif c == ')': depth -= 1
     elif c == '[': bdepth += 1
     elif c == ']': bdepth -= 1
+    elif c == ',' and depth == 0 and bdepth == 0: return False
     elif c == '*' and depth == 0 and bdepth == 0: return True
   return False
 
@@ -73,17 +75,9 @@ def _hoist_expr(expr:str, tmp:list[str], counter:list[int]) -> str:
   while i < len(expr):
     if expr[i] == '(':
       j, inner = _match_paren(expr, i)
+      is_func_call = i > 0 and (expr[i-1].isalnum() or expr[i-1] == '_')
       mul_operand = (i > 0 and expr[i-1] == '*') or (j+1 < len(expr) and expr[j+1] == '*')
-      if _is_complex_float(inner) and mul_operand:
-        name = f"_ht{counter[0]}"
-        counter[0] += 1
-        hoisted_inner = _hoist_expr(inner, tmp, counter)
-        if _is_complex_float(hoisted_inner):
-          tmp.append(f"float {name} = ({hoisted_inner.replace('+-', '-')});")
-          out.append('(' + name + ')')
-        else:
-          out.append('(' + hoisted_inner + ')')
-      elif _is_complex_float(inner) and _has_top_mul(inner):
+      if not is_func_call and _is_complex_float(inner) and (mul_operand or _has_top_mul(inner)):
         name = f"_ht{counter[0]}"
         counter[0] += 1
         hoisted_inner = _hoist_expr(inner, tmp, counter)
@@ -233,7 +227,7 @@ class MGLRenderer(CStyleLanguage):
   infinity = "INFINITY"
   nan = "NAN"
   barrier = "barrier();\n  memoryBarrierShared();"
-  extra_matcher = glsl_matcher
+  extra_matcher: PatternMatcher | None = glsl_matcher
   code_for_op = {**CStyleLanguage.code_for_op, Ops.CMOD: lambda a,b,dtype: f"(({a})-({a})/({b})*({b}))"}
 
   string_rewrite = PatternMatcher([
@@ -495,6 +489,7 @@ class GL21Renderer(MGLRenderer):
   global_max = (8192, 8192, 1)  # Limited by max texture size
   local_max = (1, 1, 1)
   supports_float4 = False
+  extra_matcher: PatternMatcher | None = None
 
   # GLSL 1.20 type mapping - no uint/int, use float for storage
   type_map = {
@@ -520,6 +515,7 @@ class GL21Renderer(MGLRenderer):
   # Integer ops emulated via float (GLSL 1.20 has no integer support)
   code_for_op = {
     **MGLRenderer.code_for_op,
+    Ops.TRUNC: lambda a, dtype: f"(floor(abs({a})) * sign({a}))",
     Ops.CMOD: lambda a, b, dtype: f"mod({a}, {b})",
     Ops.FDIV: lambda a, b, dtype: f"({a}/{b})",
     Ops.CDIV: lambda a, b, dtype: f"floor({a}/{b})",
@@ -541,7 +537,9 @@ class GL21Renderer(MGLRenderer):
     (UPat(Ops.CONST, dtype=dtypes.int64, name="x"), lambda ctx,x: f"{x.val}.0"),
     (UPat(Ops.CONST, dtype=dtypes.uint64, name="x"), lambda ctx,x: f"{x.val}.0"),
 
-    # Bitcast - identity for float<->int32/uint32 (same bit pattern)
+    # Bitcast - float bitcast from uint mantissa emulation and identity for int<->uint
+    (UPat(Ops.BITCAST, dtype=dtypes.float, name="x"),
+     lambda ctx,x: f"(({ctx[x.src[0]]} - 1065353216.0) / 8388608.0 + 1.0)"),
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: ctx[x.src[0]]),
 
     # Boolean ops via float
@@ -686,9 +684,12 @@ class GL21Renderer(MGLRenderer):
     frag += "uniform vec2 u_tex_size;\n"
     frag += "#define INFINITY 1e30\n"
     frag += "#define NAN (0.0/0.0)\n"
+    frag += "#define trunc(x) (floor(abs(x)) * sign(x))\n"
 
     # Bitwise emulation functions for GLSL 1.20
     frag += "float _bit_and(float a, float b) {\n"
+    frag += "  if (a < 0.0) a = floor(a + 4294967296.0);\n"
+    frag += "  if (b < 0.0) b = floor(b + 4294967296.0);\n"
     frag += "  float r = 0.0; float p = 1.0;\n"
     frag += "  for (int i = 0; i < 24; i++) {\n"
     frag += "    if (mod(a, 2.0) >= 1.0 && mod(b, 2.0) >= 1.0) r += p;\n"
@@ -698,6 +699,8 @@ class GL21Renderer(MGLRenderer):
     frag += "  return r;\n"
     frag += "}\n"
     frag += "float _bit_or(float a, float b) {\n"
+    frag += "  if (a < 0.0) a = floor(a + 4294967296.0);\n"
+    frag += "  if (b < 0.0) b = floor(b + 4294967296.0);\n"
     frag += "  float r = 0.0; float p = 1.0;\n"
     frag += "  for (int i = 0; i < 24; i++) {\n"
     frag += "    if (mod(a, 2.0) >= 1.0 || mod(b, 2.0) >= 1.0) r += p;\n"
@@ -707,6 +710,8 @@ class GL21Renderer(MGLRenderer):
     frag += "  return r;\n"
     frag += "}\n"
     frag += "float _bit_xor(float a, float b) {\n"
+    frag += "  if (a < 0.0) a = floor(a + 4294967296.0);\n"
+    frag += "  if (b < 0.0) b = floor(b + 4294967296.0);\n"
     frag += "  float r = 0.0; float p = 1.0;\n"
     frag += "  for (int i = 0; i < 24; i++) {\n"
     frag += "    float ma = mod(a, 2.0); float mb = mod(b, 2.0);\n"
@@ -812,6 +817,7 @@ class GL21Renderer(MGLRenderer):
       vs += "attribute float in_idx;\n"
       vs += "uniform vec2 u_tex_size;\n"
       vs += "varying float v_flat_id;\n"
+      vs += "#define trunc(x) (floor(abs(x)) * sign(x))\n"
       vs += "float _bit_and(float a, float b) {\n"
       vs += "  float r = 0.0; float p = 1.0;\n"
       vs += "  for (int i = 0; i < 24; i++) {\n"
@@ -859,6 +865,7 @@ class GL21Renderer(MGLRenderer):
       frag += "uniform vec2 u_tex_size;\n"
       frag += "#define INFINITY 1e30\n"
       frag += "#define NAN (0.0/0.0)\n"
+      frag += "#define trunc(x) (floor(abs(x)) * sign(x))\n"
       frag += "float _bit_and(float a, float b) {\n"
       frag += "  float r = 0.0; float p = 1.0;\n"
       frag += "  for (int i = 0; i < 24; i++) {\n"

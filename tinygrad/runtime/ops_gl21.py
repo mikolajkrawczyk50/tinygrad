@@ -5,7 +5,7 @@ import numpy as np
 
 from tinygrad.device import Compiled, Allocator, BufferSpec, Program, TinyELF
 from tinygrad.renderer.glsl import GL21Renderer
-from tinygrad.helpers import round_up, prod
+from tinygrad.helpers import prod
 from tinygrad.dtype import dtypes
 
 # Buffer type: moderngl.Texture
@@ -51,14 +51,20 @@ class GL21Program(Program['GL21Device']):
     self.uniform_params: list[tuple[str, Any, tuple[Any, ...]]] = []
     for name, slot, dt, shape in obj.signature:
       if shape != ():  # Texture buffer
-        derived_name = name
-        if derived_name is None:
-          shape_suffix = '_'.join([str(x) for x in shape]) if shape else ''
-          derived_name = f"data{slot}_" + shape_suffix
+        numel = prod(shape)
+        derived_name = f"data{slot}_{numel}"
+        if name is not None and name in self.prog: derived_name = name
+        elif f"data{slot}_{numel}" in self.prog: derived_name = f"data{slot}_{numel}"
+        elif name is not None and f"{name}_{numel}" in self.prog: derived_name = f"{name}_{numel}"
+        elif f"data{slot}" in self.prog: derived_name = f"data{slot}"
         self.texture_slots.append((derived_name, slot, dt, shape))
       else:  # ALU scalar uniform param (slot corresponds to index in vals)
         derived_name = f"data{slot}_"
+        if name is not None and name in self.prog: derived_name = name
+        elif f"data{slot}" in self.prog: derived_name = f"data{slot}"
         self.uniform_params.append((derived_name, dt, shape))
+
+    self.out_dtype = obj.signature[0][2] if len(obj.signature) else dtypes.float
 
     # Uniform locations
     self.u_tex_size = cast(Any, self.prog.get('u_tex_size', None))
@@ -94,6 +100,7 @@ class GL21Program(Program['GL21Device']):
     if len(raw_bufs) == 0:
       raise RuntimeError("no buffers passed to program")
     output_tex = raw_bufs[0]
+    cast(Any, output_tex).t_dtype = self.out_dtype
 
     # Check if output texture is also used as an input (read-write conflict)
     # If so, create a temporary output texture and copy result back
@@ -108,6 +115,7 @@ class GL21Program(Program['GL21Device']):
       h = max(1, (total + w - 1) // w)
       temp_output_tex = self.dev.ctx.texture((w, h), 4, dtype='f4')
       temp_output_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+      cast(Any, temp_output_tex).t_dtype = self.out_dtype
       render_target = temp_output_tex
     else:
       render_target = output_tex
@@ -147,18 +155,40 @@ class GL21Program(Program['GL21Device']):
     return None
 
 
+import inspect
+from tinygrad.device import Buffer
+from tinygrad.dtype import DType
+
 class GL21Allocator(Allocator['GL21Device']):
+  current_alloc_info: tuple[DType, int] | None = None
+
+  def alloc(self, size: int, options: BufferSpec | None = None) -> moderngl.Texture:
+    frame = inspect.currentframe()
+    dt, num_elements = dtypes.float, max(size, 1)
+    while frame:
+      self_obj = frame.f_locals.get('self')
+      if isinstance(self_obj, Buffer):
+        dt, num_elements = self_obj.dtype, self_obj.size
+        break
+      frame = frame.f_back
+    self.current_alloc_info = (dt, num_elements)
+    try:
+      return super().alloc(size, options)
+    finally:
+      self.current_alloc_info = None
+
   def _alloc(self, size: int, options: BufferSpec) -> moderngl.Texture:
-    # OpenGL 2.1: allocate as RGBA32F texture
-    # Minimum allocation size is 16 bytes (1 RGBA32F texel)
-    num_floats = round_up(size, 16) // 4  # 16-byte aligned, 4 floats per texel
-    # Use 1D texture layout: width = min(num_floats, 8192), height = ceil(num_floats/width)
-    width = min(num_floats, 8192)
-    height = max(1, (num_floats + width - 1) // width)
+    dt, num_elements = (self.current_alloc_info if self.current_alloc_info is not None
+                        else (getattr(options, 'dtype', None) or dtypes.float,
+                              getattr(options, 'size', None) or max(size, 1)))
+    width = min(num_elements, 8192)
+    height = max(1, (num_elements + width - 1) // width)
 
     tex = self.dev.ctx.texture((width, height), 4, dtype='f4')
     tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
     tex.swizzle = 'RGBA'
+    cast(Any, tex).t_dtype = dt
+    cast(Any, tex).num_elements = num_elements
     return tex
 
   def _offset(self, buf: Any, size: int, offset: int) -> Any:
@@ -171,10 +201,25 @@ class GL21Allocator(Allocator['GL21Device']):
 
   def _copyin(self, dest: GL21Buf, src: memoryview):
     buf, offset = (dest[0], dest[1]) if isinstance(dest, tuple) else (dest, 0)
-    if src.format == '?' or getattr(src, 'itemsize', 1) == 1 and src.nbytes % 4 != 0:
-      data = np.frombuffer(src, dtype=np.bool_ if src.format == '?' else np.uint8).astype(np.float32)
-    elif getattr(src, 'itemsize', 4) == 8:
-      data = np.frombuffer(src, dtype=np.float64 if src.format in ('d', 'f8') else np.int64).astype(np.float32)
+    dt = getattr(buf, 't_dtype', None)
+    if dt == dtypes.bool or src.format == '?':
+      data = np.frombuffer(src, dtype=np.bool_).astype(np.float32)
+    elif dt == dtypes.int8 or src.format == 'b':
+      data = np.frombuffer(src, dtype=np.int8).astype(np.float32)
+    elif dt == dtypes.uint8 or (src.format == 'B' and dt == dtypes.uint8):
+      data = np.frombuffer(src, dtype=np.uint8).astype(np.float32)
+    elif dt == dtypes.int16 or src.format == 'h':
+      data = np.frombuffer(src, dtype=np.int16).astype(np.float32)
+    elif dt == dtypes.uint16 or src.format == 'H':
+      data = np.frombuffer(src, dtype=np.uint16).astype(np.float32)
+    elif dt in (dtypes.int32, dtypes.int) or src.format in ('i', 'l'):
+      data = np.frombuffer(src, dtype=np.int32).astype(np.float32)
+    elif dt in (dtypes.uint32, dtypes.uint) or src.format in ('I', 'L'):
+      data = np.frombuffer(src, dtype=np.uint32).astype(np.float32)
+    elif dt in (dtypes.int64, dtypes.long) or src.format in ('q', 'Q'):
+      data = np.frombuffer(src, dtype=np.int64).astype(np.float32)
+    elif dt in (dtypes.float64, dtypes.double) or src.format == 'd':
+      data = np.frombuffer(src, dtype=np.float64).astype(np.float32)
     else:
       data = np.frombuffer(src, dtype=np.float32)
     num_floats = data.shape[0]
@@ -190,12 +235,25 @@ class GL21Allocator(Allocator['GL21Device']):
     data = buf.read()
     floats = np.frombuffer(data, dtype=np.float32)[0::4]
     float_offset = offset // 4
-    if dest.format == '?' or dest.nbytes % 4 != 0:
-      num_elements = dest.nbytes
-      converted = (floats[float_offset : float_offset + num_elements] != 0).astype(np.bool_).tobytes()
+    dt = getattr(buf, 't_dtype', None)
+    if dt == dtypes.bool or dest.format == '?':
+      converted = (floats[float_offset : float_offset + dest.nbytes] != 0).astype(np.bool_).tobytes()
+    elif dt == dtypes.int8 or dest.format == 'b':
+      converted = floats[float_offset : float_offset + dest.nbytes].astype(np.int8).tobytes()
+    elif dt == dtypes.uint8 or (dest.format == 'B' and dt == dtypes.uint8):
+      converted = floats[float_offset : float_offset + dest.nbytes].astype(np.uint8).tobytes()
+    elif dt == dtypes.int16 or dest.format == 'h':
+      converted = floats[float_offset : float_offset + dest.nbytes // 2].astype(np.int16).tobytes()
+    elif dt == dtypes.uint16 or dest.format == 'H':
+      converted = floats[float_offset : float_offset + dest.nbytes // 2].astype(np.uint16).tobytes()
+    elif dt in (dtypes.int32, dtypes.int) or dest.format in ('i', 'l'):
+      converted = floats[float_offset : float_offset + dest.nbytes // 4].astype(np.int32).tobytes()
+    elif dt in (dtypes.uint32, dtypes.uint) or dest.format in ('I', 'L'):
+      converted = floats[float_offset : float_offset + dest.nbytes // 4].astype(np.uint32).tobytes()
+    elif dt in (dtypes.int64, dtypes.long) or dest.format in ('q', 'Q'):
+      converted = floats[float_offset : float_offset + dest.nbytes // 8].astype(np.int64).tobytes()
     else:
-      needed_floats = dest.nbytes // 4
-      converted = floats[float_offset : float_offset + needed_floats].tobytes()
+      converted = floats[float_offset : float_offset + dest.nbytes // 4].astype(np.float32).tobytes()
     dest[:] = converted[:dest.nbytes]
 
 
@@ -256,6 +314,7 @@ _jit_orig: Any = getattr(TinyJit, "_jit_orig", cast(Any, TinyJit).__call__)
 _softmax_orig = getattr(OpMixin, "_softmax_orig", getattr(OpMixin, "softmax", None))
 _log_softmax_orig = getattr(OpMixin, "_log_softmax_orig", getattr(OpMixin, "log_softmax", None))
 _cross_entropy_orig = getattr(OpMixin, "_cross_entropy_orig", getattr(OpMixin, "cross_entropy", None))
+_rand_internal_orig = getattr(RandMixin, "_rand_internal_orig", getattr(RandMixin, "_rand", None))
 _rand_orig = getattr(RandMixin, "_rand_orig", getattr(RandMixin, "rand", None))
 _randn_orig = getattr(RandMixin, "_randn_orig", getattr(RandMixin, "randn", None))
 _uniform_orig = getattr(RandMixin, "_uniform_orig", getattr(RandMixin, "uniform", None))
@@ -272,6 +331,7 @@ setattr(TinyJit, "_jit_orig", _jit_orig)
 if _softmax_orig: setattr(OpMixin, "_softmax_orig", _softmax_orig)
 if _log_softmax_orig: setattr(OpMixin, "_log_softmax_orig", _log_softmax_orig)
 if _cross_entropy_orig: setattr(OpMixin, "_cross_entropy_orig", _cross_entropy_orig)
+if _rand_internal_orig: setattr(RandMixin, "_rand_internal_orig", _rand_internal_orig)
 if _rand_orig: setattr(RandMixin, "_rand_orig", _rand_orig)
 if _randn_orig: setattr(RandMixin, "_randn_orig", _randn_orig)
 if _uniform_orig: setattr(RandMixin, "_uniform_orig", _uniform_orig)
@@ -281,34 +341,27 @@ def _conv2d_gl21(self, weight, bias=None, groups=1, stride=1, dilation=1, paddin
   dev = getattr(self, "device", None) or Device.DEFAULT
   if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     with Context(WINO=0):
-      self_real = self.realize()
-      buf_in = self_real.uop.buffer
-      if buf_in is not None:
-        self.uop = UOp.from_buffer(buf_in).reshape(self.shape)
-        self_real = self
-      ret = _conv2d_orig(self_real, weight, bias, groups, stride, dilation, padding, dtype)
-      ret = ret.realize()
-      buf_out = ret.uop.buffer
-      if buf_out is not None:
-        ret.uop = UOp.from_buffer(buf_out).reshape(ret.shape)
-      return ret
+      return _conv2d_orig(self, weight, bias, groups, stride, dilation, padding, dtype)
   return _conv2d_orig(self, weight, bias, groups, stride, dilation, padding, dtype)
 
 def _max_pool2d_gl21(self, kernel_size:tuple[int, ...]=(2,2), stride=None, dilation=1, padding:int|tuple[int, ...]=0,
                      ceil_mode=False, return_indices=False):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     # Use the fallback implementation (already uses elementwise ops + reductions)
     return _max_pool2d_orig(self, kernel_size, stride, dilation, padding, ceil_mode, return_indices)
   return _max_pool2d_orig(self, kernel_size, stride, dilation, padding, ceil_mode, return_indices)
 
 def _avg_pool2d_gl21(self, kernel_size:tuple[int, ...]=(2,2), stride=None, dilation=1, padding:int|tuple[int, ...]=0,
                      ceil_mode=False, count_include_pad=True):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     return _avg_pool2d_orig(self, kernel_size, stride, dilation, padding, ceil_mode, count_include_pad)
   return _avg_pool2d_orig(self, kernel_size, stride, dilation, padding, ceil_mode, count_include_pad)
 
 def _matmul_gl21(self, x, reverse=False, dtype=None):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     # Naive matmul using elementwise ops + sum reduction (already works on GL21)
     if reverse: x = x.T
     # self: (..., M, K), x: (..., K, N) -> output: (..., M, N)
@@ -328,7 +381,8 @@ def _matmul_gl21(self, x, reverse=False, dtype=None):
   return _matmul_orig(self, x, reverse, dtype)
 
 def _linear_gl21(self, weight, bias=None, dtype=None):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     # linear = self @ weight + bias  (weight already transposed by nn.Linear)
     ret = self.matmul(weight, dtype=dtype)
     if bias is not None:
@@ -337,7 +391,8 @@ def _linear_gl21(self, weight, bias=None, dtype=None):
   return _linear_orig(self, weight, bias, dtype)
 
 def _softmax_gl21(self, axis=-1):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     # 3-pass softmax: max -> exp + sum -> normalize
     x = self
     x_max = x.max(axis=axis, keepdim=True)
@@ -347,7 +402,8 @@ def _softmax_gl21(self, axis=-1):
   return _softmax_orig(self, axis) if _softmax_orig is not None else self.softmax(axis)
 
 def _log_softmax_gl21(self, axis=-1):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     x = self
     x_max = x.max(axis=axis, keepdim=True)
     x_exp = (x - x_max).exp()
@@ -356,7 +412,8 @@ def _log_softmax_gl21(self, axis=-1):
   return _log_softmax_orig(self, axis) if _log_softmax_orig is not None else self.log_softmax(axis)
 
 def _cross_entropy_gl21(self, Y, reduction="mean", label_smoothing=0.0):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     # Match original implementation: uses _one_hot_along_dim
     assert 0.0 <= label_smoothing <= 1.0, "label_smoothing must be in [0.0, 1.0]"
     classes_dim = 0 if self.ndim == 1 else 1
@@ -367,6 +424,17 @@ def _cross_entropy_gl21(self, Y, reduction="mean", label_smoothing=0.0):
     return -self.log_softmax(classes_dim).mul(Y).sum(classes_dim)._do_reduction(reduction)
   if _cross_entropy_orig is not None: return _cross_entropy_orig(self, Y, reduction, label_smoothing)
   return self.cross_entropy(Y, reduction, label_smoothing)
+
+def _rand_internal_gl21(cls, key, counter, shape, dtype, contiguous=True):
+  dev = canonicalize_device(Device.DEFAULT)
+  if str(dev).startswith("GL21"):
+    shape = argfix(*shape)
+    dt = dtype or dtypes.default_float
+    data = np.random.rand(*shape).astype(np.float32)
+    return cls(data, device=dev, dtype=dt)
+  target_cls = cls if issubclass(cls, Tensor) else Tensor
+  if _rand_internal_orig is not None: return _rand_internal_orig.__func__(target_cls, key, counter, shape, dtype, contiguous=contiguous)
+  return target_cls._rand(key, counter, shape, dtype, contiguous=contiguous)
 
 def _rand_gl21(cls, *shape, device=None, dtype=None, **kwargs):
   dev = canonicalize_device(device or Device.DEFAULT)
@@ -432,18 +500,31 @@ if _log_softmax_orig or hasattr(OpMixin, "log_softmax"):
   setattr(OpMixin, "log_softmax", _log_softmax_gl21)
 if _cross_entropy_orig or hasattr(OpMixin, "cross_entropy"):
   setattr(OpMixin, "cross_entropy", _cross_entropy_gl21)
-if _rand_orig: setattr(RandMixin, "rand", classmethod(_rand_gl21))
-if _randn_orig: setattr(RandMixin, "randn", classmethod(_randn_gl21))
-if _uniform_orig: setattr(RandMixin, "uniform", classmethod(_uniform_gl21))
-if _normal_orig: setattr(RandMixin, "normal", classmethod(_normal_gl21))
-
-# Also patch Tensor and TinyJit classes directly (since they may be imported before device creation)
 from tinygrad.tensor import Tensor
 from tinygrad.mixin.creation import CreationMixin
+
+if _rand_internal_orig:
+  setattr(RandMixin, "_rand", classmethod(_rand_internal_gl21))
+  setattr(Tensor, "_rand", classmethod(_rand_internal_gl21))
+if _rand_orig:
+  setattr(RandMixin, "rand", classmethod(_rand_gl21))
+  setattr(Tensor, "rand", classmethod(_rand_gl21))
+if _randn_orig:
+  setattr(RandMixin, "randn", classmethod(_randn_gl21))
+  setattr(Tensor, "randn", classmethod(_randn_gl21))
+if _uniform_orig:
+  setattr(RandMixin, "uniform", classmethod(_uniform_gl21))
+  setattr(Tensor, "uniform", classmethod(_uniform_gl21))
+if _normal_orig:
+  setattr(RandMixin, "normal", classmethod(_normal_gl21))
+  setattr(Tensor, "normal", classmethod(_normal_gl21))
+
+# Also patch Tensor and TinyJit classes directly (since they may be imported before device creation)
 _full_orig: Any = getattr(CreationMixin, "_full_orig", CreationMixin.full)
 setattr(CreationMixin, "_full_orig", _full_orig)
 def _full_gl21(cls, shape, fill_value, *args, **kwargs):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(cls, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     shape = _unwrap_bind(shape)
   fn = getattr(_full_orig, "__func__", _full_orig)
   return fn(cls, shape, fill_value, *args, **kwargs)
@@ -479,10 +560,6 @@ if _log_softmax_orig or hasattr(Tensor, "log_softmax"):
   setattr(Tensor, "log_softmax", _log_softmax_gl21)
 if _cross_entropy_orig or hasattr(Tensor, "cross_entropy"):
   setattr(Tensor, "cross_entropy", _cross_entropy_gl21)
-if _rand_orig: setattr(Tensor, "rand", classmethod(_rand_gl21))
-if _randn_orig: setattr(Tensor, "randn", classmethod(_randn_gl21))
-if _uniform_orig: setattr(Tensor, "uniform", classmethod(_uniform_gl21))
-if _normal_orig: setattr(Tensor, "normal", classmethod(_normal_gl21))
 
 # Engine runtime hooks (keeps core tinygrad engine completely unmodified)
 try:

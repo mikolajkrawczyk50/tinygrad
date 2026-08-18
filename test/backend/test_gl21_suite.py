@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, Device, dtypes, nn, TinyJit, Context
+from tinygrad import Tensor, Device, dtypes, nn, TinyJit, Context, Variable
 
 DEV = "GL21"
 # Ensure GL21 backend is initialized and patched
@@ -646,6 +646,287 @@ class TestGL21EndToEnd(unittest.TestCase):
     max_diff = max(abs(c - g) for c, g in zip(results['CPU'], results['GL21']))
     np.testing.assert_allclose(results['GL21'], results['CPU'], rtol=1e-4, atol=1e-4)
     self.assertLess(max_diff, 1e-4)
+
+  def test_tinyesrgan_animevideov3_1to1_parity(self):
+    class TinyESRGANAnimeVideoV3:
+      def __init__(self, num_in_ch=3, num_out_ch=3, num_feat=16, num_conv=4, upscale=4):
+        self.upscale = upscale
+        self.conv_first = nn.Conv2d(num_in_ch, num_feat, 3, padding=1)
+        self.prelu_first = Tensor.ones(num_feat, 1, 1) * 0.2
+        self.body_convs = [nn.Conv2d(num_feat, num_feat, 3, padding=1) for _ in range(num_conv - 1)]
+        self.body_prelus = [Tensor.ones(num_feat, 1, 1) * 0.2 for _ in range(num_conv - 1)]
+        self.conv_last = nn.Conv2d(num_feat, num_out_ch * upscale * upscale, 3, padding=1)
+
+      def _prelu(self, x, slope):
+        return (x > 0).where(x, x * slope)
+
+      def _pixel_shuffle(self, x, r=4):
+        B, C_rr, H, W = x.shape
+        C = C_rr // (r * r)
+        return x.reshape(B, C, r, r, H, W).permute(0, 1, 4, 2, 5, 3).reshape(B, C, H * r, W * r)
+
+      def __call__(self, x: Tensor) -> Tensor:
+        feat = self._prelu(self.conv_first(x), self.prelu_first)
+        for c, p in zip(self.body_convs, self.body_prelus):
+          feat = self._prelu(c(feat), p)
+        out = self.conv_last(feat)
+        out = self._pixel_shuffle(out, self.upscale)
+        base = x.interpolate(size=(x.shape[2] * self.upscale, x.shape[3] * self.upscale), mode='nearest')
+        return out + base
+
+    np.random.seed(42)
+    x_np = np.random.rand(1, 3, 16, 16).astype(np.float32)
+
+    Tensor.manual_seed(42)
+    model_cpu = TinyESRGANAnimeVideoV3()
+    out_cpu = model_cpu(Tensor(x_np, device='CPU')).numpy()
+
+    model_gl = TinyESRGANAnimeVideoV3()
+    model_gl.conv_first.weight = model_cpu.conv_first.weight.to('GL21').realize()
+    if model_cpu.conv_first.bias is not None: model_gl.conv_first.bias = model_cpu.conv_first.bias.to('GL21').realize()
+    model_gl.prelu_first = model_cpu.prelu_first.to('GL21').realize()
+    for i in range(len(model_cpu.body_convs)):
+      model_gl.body_convs[i].weight = model_cpu.body_convs[i].weight.to('GL21').realize()
+      if model_cpu.body_convs[i].bias is not None: model_gl.body_convs[i].bias = model_cpu.body_convs[i].bias.to('GL21').realize()
+      model_gl.body_prelus[i] = model_cpu.body_prelus[i].to('GL21').realize()
+    model_gl.conv_last.weight = model_cpu.conv_last.weight.to('GL21').realize()
+    if model_cpu.conv_last.bias is not None: model_gl.conv_last.bias = model_cpu.conv_last.bias.to('GL21').realize()
+
+    out_gl = model_gl(Tensor(x_np, device='GL21')).numpy()
+    max_diff = np.abs(out_cpu - out_gl).max()
+    np.testing.assert_allclose(out_gl, out_cpu, rtol=1e-4, atol=1e-4)
+    self.assertLess(max_diff, 1e-4)
+
+  def test_realesrgan_x4plus_1to1_parity(self):
+    class ResidualDenseBlock:
+      def __init__(self, num_feat=16, num_grow_ch=8):
+        self.conv1 = nn.Conv2d(num_feat, num_grow_ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(num_feat + num_grow_ch, num_grow_ch, 3, padding=1)
+        self.conv3 = nn.Conv2d(num_feat + 2 * num_grow_ch, num_grow_ch, 3, padding=1)
+        self.conv4 = nn.Conv2d(num_feat + 3 * num_grow_ch, num_grow_ch, 3, padding=1)
+        self.conv5 = nn.Conv2d(num_feat + 4 * num_grow_ch, num_feat, 3, padding=1)
+
+      def __call__(self, x: Tensor) -> Tensor:
+        x1 = self.conv1(x).leaky_relu(0.2)
+        x2 = self.conv2(Tensor.cat(x, x1, dim=1)).leaky_relu(0.2)
+        x3 = self.conv3(Tensor.cat(x, x1, x2, dim=1)).leaky_relu(0.2)
+        x4 = self.conv4(Tensor.cat(x, x1, x2, x3, dim=1)).leaky_relu(0.2)
+        x5 = self.conv5(Tensor.cat(x, x1, x2, x3, x4, dim=1))
+        return x5 * 0.2 + x
+
+    class RRDB:
+      def __init__(self, num_feat=16, num_grow_ch=8):
+        self.rdb1 = ResidualDenseBlock(num_feat, num_grow_ch)
+        self.rdb2 = ResidualDenseBlock(num_feat, num_grow_ch)
+        self.rdb3 = ResidualDenseBlock(num_feat, num_grow_ch)
+
+      def __call__(self, x: Tensor) -> Tensor:
+        out = self.rdb1(x)
+        out = self.rdb2(out)
+        out = self.rdb3(out)
+        return out * 0.2 + x
+
+    class RealESRGANx4Plus:
+      def __init__(self, num_in_ch=3, num_out_ch=3, num_feat=16, num_block=2, num_grow_ch=8):
+        self.conv_first = nn.Conv2d(num_in_ch, num_feat, 3, padding=1)
+        self.body = [RRDB(num_feat, num_grow_ch) for _ in range(num_block)]
+        self.conv_body = nn.Conv2d(num_feat, num_feat, 3, padding=1)
+        self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, padding=1)
+        self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, padding=1)
+        self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, padding=1)
+        self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, padding=1)
+
+      def __call__(self, x: Tensor) -> Tensor:
+        feat = self.conv_first(x)
+        body_feat = feat
+        for block in self.body:
+          body_feat = block(body_feat)
+        body_feat = self.conv_body(body_feat)
+        feat = feat + body_feat
+        feat = self.conv_up1(feat.interpolate(size=(feat.shape[2]*2, feat.shape[3]*2), mode='nearest')).leaky_relu(0.2)
+        feat = self.conv_up2(feat.interpolate(size=(feat.shape[2]*2, feat.shape[3]*2), mode='nearest')).leaky_relu(0.2)
+        return self.conv_last(self.conv_hr(feat).leaky_relu(0.2))
+
+    np.random.seed(42)
+    Tensor.manual_seed(42)
+    x_np = np.random.rand(1, 3, 16, 16).astype(np.float32)
+
+    model_cpu = RealESRGANx4Plus()
+    out_cpu = model_cpu(Tensor(x_np, device='CPU')).numpy()
+
+    def copy_layer(src, dst):
+      dst.weight = src.weight.to('GL21').realize()
+      if src.bias is not None: dst.bias = src.bias.to('GL21').realize()
+
+    def copy_rdb(src, dst):
+      copy_layer(src.conv1, dst.conv1)
+      copy_layer(src.conv2, dst.conv2)
+      copy_layer(src.conv3, dst.conv3)
+      copy_layer(src.conv4, dst.conv4)
+      copy_layer(src.conv5, dst.conv5)
+
+    def copy_rrdb(src, dst):
+      copy_rdb(src.rdb1, dst.rdb1)
+      copy_rdb(src.rdb2, dst.rdb2)
+      copy_rdb(src.rdb3, dst.rdb3)
+
+    model_gl = RealESRGANx4Plus()
+    copy_layer(model_cpu.conv_first, model_gl.conv_first)
+    for s_b, d_b in zip(model_cpu.body, model_gl.body):
+      copy_rrdb(s_b, d_b)
+    copy_layer(model_cpu.conv_body, model_gl.conv_body)
+    copy_layer(model_cpu.conv_up1, model_gl.conv_up1)
+    copy_layer(model_cpu.conv_up2, model_gl.conv_up2)
+    copy_layer(model_cpu.conv_hr, model_gl.conv_hr)
+    copy_layer(model_cpu.conv_last, model_gl.conv_last)
+
+    out_gl = model_gl(Tensor(x_np, device='GL21')).numpy()
+    max_diff = np.abs(out_cpu - out_gl).max()
+    np.testing.assert_allclose(out_gl, out_cpu, rtol=1e-4, atol=1e-4)
+    self.assertLess(max_diff, 1e-4)
+
+  def test_tinyrife_v46_1to1_parity(self):
+    def warp(img: Tensor, flow: Tensor) -> Tensor:
+      B, C, H, W = img.shape
+      y_coords = Tensor.arange(H).reshape(1, 1, H, 1).expand((B, 1, H, W))
+      x_coords = Tensor.arange(W).reshape(1, 1, 1, W).expand((B, 1, H, W))
+      gx = x_coords + flow[:, 0:1]
+      gy = y_coords + flow[:, 1:2]
+      x0 = gx.floor().clip(0, W - 1)
+      x1 = (x0 + 1).clip(0, W - 1)
+      y0 = gy.floor().clip(0, H - 1)
+      y1 = (y0 + 1).clip(0, H - 1)
+      wa = (x1 - gx) * (y1 - gy)
+      wb = (x1 - gx) * (gy - y0)
+      wc = (gx - x0) * (y1 - gy)
+      wd = (gx - x0) * (gy - y0)
+      img_flat = img.reshape(B, C, H * W)
+      idx_a = (y0 * W + x0).cast(dtypes.int32).reshape(B, 1, H * W).expand((B, C, H * W))
+      idx_b = (y1 * W + x0).cast(dtypes.int32).reshape(B, 1, H * W).expand((B, C, H * W))
+      idx_c = (y0 * W + x1).cast(dtypes.int32).reshape(B, 1, H * W).expand((B, C, H * W))
+      idx_d = (y1 * W + x1).cast(dtypes.int32).reshape(B, 1, H * W).expand((B, C, H * W))
+      Ia = img_flat.gather(2, idx_a).reshape(B, C, H, W)
+      Ib = img_flat.gather(2, idx_b).reshape(B, C, H, W)
+      Ic = img_flat.gather(2, idx_c).reshape(B, C, H, W)
+      Id = img_flat.gather(2, idx_d).reshape(B, C, H, W)
+      return wa * Ia + wb * Ib + wc * Ic + wd * Id
+
+    class ResConv:
+      def __init__(self, c):
+        self.conv1 = nn.Conv2d(c, c, 3, padding=1)
+        self.conv2 = nn.Conv2d(c, c, 3, padding=1)
+      def __call__(self, x: Tensor) -> Tensor:
+        return x + self.conv2(self.conv1(x).leaky_relu(0.2)).leaky_relu(0.2)
+
+    class IFBlock:
+      def __init__(self, in_planes, c=32):
+        self.conv0_0 = nn.Conv2d(in_planes, c // 2, 3, stride=2, padding=1)
+        self.conv0_1 = nn.Conv2d(c // 2, c, 3, stride=2, padding=1)
+        self.res1 = ResConv(c)
+        self.res2 = ResConv(c)
+        self.conv_out = nn.Conv2d(c, 5 * 4 * 4, 3, padding=1)
+      def _pixel_shuffle(self, x, r=4):
+        B, C_rr, H, W = x.shape
+        C = C_rr // (r * r)
+        return x.reshape(B, C, r, r, H, W).permute(0, 1, 4, 2, 5, 3).reshape(B, C, H * r, W * r)
+      def __call__(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        feat = self.conv0_0(x).leaky_relu(0.2)
+        feat = self.conv0_1(feat).leaky_relu(0.2)
+        feat = self.res1(feat)
+        feat = self.res2(feat)
+        out = self._pixel_shuffle(self.conv_out(feat), 4)
+        flow = out[:, :4]
+        mask = out[:, 4:5].sigmoid()
+        return flow, mask
+
+    class TinyRIFE:
+      def __init__(self):
+        self.block0 = IFBlock(6, c=32)
+        self.block1 = IFBlock(11, c=32)
+      def __call__(self, i0: Tensor, i1: Tensor, timestep: float = 0.5) -> Tensor:
+        B, C, H, W = i0.shape
+        t_tensor = Tensor.full((B, 1, H, W), timestep, device=i0.device)
+        flow0, mask0 = self.block0(Tensor.cat(i0, i1, dim=1))
+        warped_i0 = warp(i0, flow0[:, :2])
+        warped_i1 = warp(i1, flow0[:, 2:])
+        inp1 = Tensor.cat(warped_i0, warped_i1, flow0, t_tensor, dim=1)
+        dflow, dmask = self.block1(inp1)
+        flow1 = flow0 + dflow
+        mask1 = (mask0 + dmask).sigmoid()
+        final_i0 = warp(i0, flow1[:, :2])
+        final_i1 = warp(i1, flow1[:, 2:])
+        return mask1 * final_i0 + (1.0 - mask1) * final_i1
+
+    np.random.seed(42)
+    Tensor.manual_seed(42)
+    i0_np = np.random.rand(1, 3, 16, 16).astype(np.float32)
+    i1_np = np.random.rand(1, 3, 16, 16).astype(np.float32)
+
+    model_cpu = TinyRIFE()
+    out_cpu = model_cpu(Tensor(i0_np, device='CPU'), Tensor(i1_np, device='CPU')).numpy()
+
+    def copy_block(src, dst):
+      dst.conv0_0.weight = src.conv0_0.weight.to('GL21').realize()
+      if src.conv0_0.bias is not None: dst.conv0_0.bias = src.conv0_0.bias.to('GL21').realize()
+      dst.conv0_1.weight = src.conv0_1.weight.to('GL21').realize()
+      if src.conv0_1.bias is not None: dst.conv0_1.bias = src.conv0_1.bias.to('GL21').realize()
+      for s_res, d_res in [(src.res1, dst.res1), (src.res2, dst.res2)]:
+        d_res.conv1.weight = s_res.conv1.weight.to('GL21').realize()
+        if s_res.conv1.bias is not None: d_res.conv1.bias = s_res.conv1.bias.to('GL21').realize()
+        d_res.conv2.weight = s_res.conv2.weight.to('GL21').realize()
+        if s_res.conv2.bias is not None: d_res.conv2.bias = s_res.conv2.bias.to('GL21').realize()
+      dst.conv_out.weight = src.conv_out.weight.to('GL21').realize()
+      if src.conv_out.bias is not None: dst.conv_out.bias = src.conv_out.bias.to('GL21').realize()
+
+    model_gl = TinyRIFE()
+    copy_block(model_cpu.block0, model_gl.block0)
+    copy_block(model_cpu.block1, model_gl.block1)
+
+    out_gl = model_gl(Tensor(i0_np, device='GL21'), Tensor(i1_np, device='GL21')).numpy()
+    max_diff = np.abs(out_cpu - out_gl).max()
+    np.testing.assert_allclose(out_gl, out_cpu, rtol=1e-4, atol=1e-4)
+    self.assertLess(max_diff, 1e-4)
+
+  def test_gpt2_small_model_1to1_parity(self):
+    from examples.gpt2 import Transformer
+    from tinygrad.nn.state import get_state_dict, load_state_dict
+
+    dim, n_heads, n_layers, vocab_size = 64, 4, 2, 128
+    Tensor.manual_seed(42)
+    np.random.seed(42)
+
+    with Context(DEV='CPU'):
+      model_cpu = Transformer(dim=dim, n_heads=n_heads, n_layers=n_layers, norm_eps=1e-5, vocab_size=vocab_size, max_seq_len=64)
+      model_cpu.allpos = Tensor.arange(0, 64).reshape(1, -1).realize()
+
+    with Context(DEV='GL21'):
+      model_gl = Transformer(dim=dim, n_heads=n_heads, n_layers=n_layers, norm_eps=1e-5, vocab_size=vocab_size, max_seq_len=64)
+      sd_cpu = get_state_dict(model_cpu)
+      sd_gl = {k: v.to('GL21').realize() for k, v in sd_cpu.items()}
+      load_state_dict(model_gl, sd_gl)
+      model_gl.allpos = Tensor.arange(0, 64).to('GL21').reshape(1, -1).realize()
+
+    prompt = [12, 45, 78, 23]
+    gen_cpu = list(prompt)
+    gen_gl = list(prompt)
+
+    # 3-step generation
+    for step in range(3):
+      with Context(DEV='CPU'):
+        t_c = Tensor([[gen_cpu[-1]]], device='CPU') if step > 0 else Tensor([prompt], device='CPU')
+        pos_c = Variable('start_pos', 0, 64).bind(0 if step == 0 else len(gen_cpu) - 1)
+        next_c = int(model_cpu(t_c, pos_c, temperature=0.0).numpy().flatten()[0])
+        gen_cpu.append(next_c)
+
+      with Context(DEV='GL21'):
+        t_g = Tensor([[gen_gl[-1]]], device='GL21') if step > 0 else Tensor([prompt], device='GL21')
+        pos_g = Variable('start_pos', 0, 64).bind(0 if step == 0 else len(gen_gl) - 1)
+        next_g = int(model_gl(t_g, pos_g, temperature=0.0).numpy().flatten()[0])
+        gen_gl.append(next_g)
+
+      self.assertEqual(next_c, next_g)
+
+    self.assertEqual(gen_cpu, gen_gl)
 
 if __name__ == '__main__':
   unittest.main()

@@ -650,7 +650,7 @@ if _normal_orig:
 _full_orig: Any = getattr(CreationMixin, "_full_orig", CreationMixin.full)
 setattr(CreationMixin, "_full_orig", _full_orig)
 def _full_gl21(cls, shape, fill_value, *args, **kwargs):
-  dev = getattr(cls, "device", None) or Device.DEFAULT
+  dev = kwargs.get("device", None) or getattr(cls, "device", None) or Device.DEFAULT
   if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     shape = _unwrap_bind(shape)
   fn = getattr(_full_orig, "__func__", _full_orig)

@@ -542,6 +542,13 @@ class GL21Renderer(MGLRenderer):
      lambda ctx,x: f"(mod({ctx[x.src[0]]}, 8388608.0) / 8388608.0 + 1.0)"),
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: ctx[x.src[0]]),
 
+    # Cast to integer dtypes (float truncation) and bool
+    (UPat(Ops.CAST, dtype=(dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int64,
+                           dtypes.uint8, dtypes.uint16, dtypes.uint32, dtypes.uint64), name="x"),
+     lambda ctx,x: f"(floor(abs({ctx[x.src[0]]})) * sign({ctx[x.src[0]]}))"),
+    (UPat(Ops.CAST, dtype=dtypes.bool, name="x"),
+     lambda ctx,x: f"float(({ctx[x.src[0]]}) != 0.0)"),
+
     # Boolean ops via float
     (UPat(Ops.CMPNE, src=(UPat.var("a", dtypes.bool), UPat.var("b")), name="x"),
      lambda ctx,a,b,x: f"float(({ctx[a]})!=({ctx[b]}))"),

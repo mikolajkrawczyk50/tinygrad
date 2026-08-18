@@ -1,5 +1,5 @@
 from typing import Any, cast
-import struct
+import os, struct
 import moderngl
 import numpy as np
 
@@ -257,10 +257,117 @@ class GL21Allocator(Allocator['GL21Device']):
     dest[:] = converted[:dest.nbytes]
 
 
+def _create_x11_glx_context() -> tuple[moderngl.Context, Any]:
+  import os
+  import ctypes.util
+  from collections import deque
+  import moderngl.mgl as mgl
+
+  class XVisualInfo(ctypes.Structure):
+    _fields_ = [
+      ("visual", ctypes.c_void_p), ("visualid", ctypes.c_ulong), ("screen", ctypes.c_int),
+      ("depth", ctypes.c_int), ("class", ctypes.c_int), ("red_mask", ctypes.c_ulong),
+      ("green_mask", ctypes.c_ulong), ("blue_mask", ctypes.c_ulong),
+      ("colormap_size", ctypes.c_int), ("bits_per_rgb", ctypes.c_int)
+    ]
+
+  class XSetWindowAttributes(ctypes.Structure):
+    _fields_ = [
+      ("background_pixmap", ctypes.c_ulong), ("background_pixel", ctypes.c_ulong),
+      ("border_pixmap", ctypes.c_ulong), ("border_pixel", ctypes.c_ulong),
+      ("bit_gravity", ctypes.c_int), ("win_gravity", ctypes.c_int),
+      ("backing_store", ctypes.c_int), ("backing_planes", ctypes.c_ulong),
+      ("backing_pixel", ctypes.c_ulong), ("save_under", ctypes.c_int),
+      ("event_mask", ctypes.c_long), ("do_not_propagate_mask", ctypes.c_long),
+      ("override_redirect", ctypes.c_int), ("colormap", ctypes.c_ulong),
+      ("cursor", ctypes.c_ulong)
+    ]
+
+  x11_lib_name = ctypes.util.find_library("X11") or "libX11.so.6"
+  gl_lib_name = ctypes.util.find_library("GL") or "libGL.so.1"
+  x11 = ctypes.cdll.LoadLibrary(x11_lib_name)
+  gl = ctypes.cdll.LoadLibrary(gl_lib_name)
+
+  x11.XOpenDisplay.restype = ctypes.c_void_p
+  x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+  x11.XDefaultScreen.restype = ctypes.c_int
+  x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+  x11.XRootWindow.restype = ctypes.c_ulong
+  x11.XRootWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+  x11.XCreateColormap.restype = ctypes.c_ulong
+  x11.XCreateColormap.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_int]
+  x11.XCreateWindow.restype = ctypes.c_ulong
+  x11.XCreateWindow.argtypes = [
+    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+    ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XSetWindowAttributes)
+  ]
+
+  gl.glXChooseVisual.restype = ctypes.POINTER(XVisualInfo)
+  gl.glXChooseVisual.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+  gl.glXCreateContext.restype = ctypes.c_void_p
+  gl.glXCreateContext.argtypes = [ctypes.c_void_p, ctypes.POINTER(XVisualInfo), ctypes.c_void_p, ctypes.c_int]
+  gl.glXMakeCurrent.restype = ctypes.c_int
+  gl.glXMakeCurrent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
+
+  display_str = os.environ.get("DISPLAY") or ":0"
+  dpy = x11.XOpenDisplay(display_str.encode())
+  if not dpy:
+    raise RuntimeError(f"Cannot open X display {display_str}")
+  scr = x11.XDefaultScreen(dpy)
+  root = x11.XRootWindow(dpy, scr)
+  attribs = (ctypes.c_int * 8)(4, 8, 8, 9, 8, 10, 8, 0)
+  vis = gl.glXChooseVisual(dpy, scr, attribs)
+  if not vis:
+    raise RuntimeError("glXChooseVisual failed")
+  cmap = x11.XCreateColormap(dpy, root, vis.contents.visual, 0)
+  swa = XSetWindowAttributes()
+  swa.colormap = cmap
+  win = x11.XCreateWindow(dpy, root, 0, 0, 1, 1, 0, vis.contents.depth, 1, vis.contents.visual, (1 << 13) | (1 << 11), ctypes.byref(swa))
+  ctx_glx = gl.glXCreateContext(dpy, vis, None, 1)
+  if not gl.glXMakeCurrent(dpy, win, ctx_glx):
+    raise RuntimeError("glXMakeCurrent failed")
+
+  mglo, version_code = mgl.create_context(glversion=210, mode="detect")
+  ctx = moderngl.Context.__new__(moderngl.Context)
+  c = cast(Any, ctx)
+  c.mglo = mglo
+  c.version_code = version_code if version_code >= 210 else 210
+  c._info = None
+  c._extensions = None
+  c.extra = None
+  c._gc_mode = None
+  c._objects = deque()
+  c._screen = ctx.detect_framebuffer(0)
+  c.fbo = ctx.detect_framebuffer()
+  c.mglo.fbo = c.fbo.mglo
+  return ctx, (dpy, win, ctx_glx, x11, gl)
+
+def create_gl21_context() -> tuple[moderngl.Context, Any]:
+  backend = os.environ.get("GL21_BACKEND", "").lower()
+  if backend in ("glx", "x11") or (backend != "egl" and (os.environ.get("DISPLAY") or os.path.exists("/tmp/.X11-unix/X0"))):
+    try:
+      return _create_x11_glx_context()
+    except Exception:
+      if backend in ("glx", "x11"): raise
+
+  try:
+    ctx = moderngl.create_standalone_context(backend='egl', require=210)  # type: ignore[arg-type]
+    return ctx, None
+  except Exception:
+    pass
+
+  try:
+    ctx = moderngl.create_standalone_context(require=210)
+    return ctx, None
+  except Exception:
+    pass
+
+  return _create_x11_glx_context()
+
+
 class GL21Device(Compiled):
   def __init__(self, device: str):
-    # Create OpenGL 2.1 context via EGL
-    self.ctx = moderngl.create_standalone_context(backend='egl', require=210)  # type: ignore[arg-type]
+    self.ctx, self._native_handles = create_gl21_context()
     super().__init__(device, GL21Allocator(self), [GL21Renderer], GL21Program, arch="gl21")
 
   def synchronize(self):

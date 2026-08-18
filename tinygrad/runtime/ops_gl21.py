@@ -278,9 +278,20 @@ if _uniform_orig: setattr(RandMixin, "_uniform_orig", _uniform_orig)
 if _normal_orig: setattr(RandMixin, "_normal_orig", _normal_orig)
 
 def _conv2d_gl21(self, weight, bias=None, groups=1, stride=1, dilation=1, padding=0, dtype=None):
-  if Device.DEFAULT.startswith("GL21"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
     with Context(WINO=0):
-      return _conv2d_orig(self, weight, bias, groups, stride, dilation, padding, dtype)
+      self_real = self.realize()
+      buf_in = self_real.uop.buffer
+      if buf_in is not None:
+        self.uop = UOp.from_buffer(buf_in).reshape(self.shape)
+        self_real = self
+      ret = _conv2d_orig(self_real, weight, bias, groups, stride, dilation, padding, dtype)
+      ret = ret.realize()
+      buf_out = ret.uop.buffer
+      if buf_out is not None:
+        ret.uop = UOp.from_buffer(buf_out).reshape(ret.shape)
+      return ret
   return _conv2d_orig(self, weight, bias, groups, stride, dilation, padding, dtype)
 
 def _max_pool2d_gl21(self, kernel_size:tuple[int, ...]=(2,2), stride=None, dilation=1, padding:int|tuple[int, ...]=0,

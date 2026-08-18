@@ -587,6 +587,9 @@ class GL21Renderer(MGLRenderer):
      lambda ctx,b,idx,bidx,v,gate,x: f"if (bool({ctx[gate]})) " + (
        f"gl_FragColor.r = {ctx[v]};" if b.addrspace == AddrSpace.GLOBAL else f"{ctx[b]}[int({ctx[idx]})] = {ctx[v]};")),
 
+    # IF condition - must be scalar bool in GLSL 1.20
+    (UPat(Ops.IF, name="x"), lambda ctx,x: f"if (bool({ctx[x.src[0]]})) {{"),
+
     # Fallback LOAD/STORE
     (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("v"), UPat.var("gate")), name="x"),
      lambda ctx,bidx,v,gate,x: f"(bool({ctx[gate]}) ? texture2D({ctx[bidx]}, tex_coord).r : {ctx[v]})"),

@@ -539,7 +539,7 @@ class GL21Renderer(MGLRenderer):
 
     # Bitcast - float bitcast from uint mantissa emulation and identity for int<->uint
     (UPat(Ops.BITCAST, dtype=dtypes.float, name="x"),
-     lambda ctx,x: f"(({ctx[x.src[0]]} - 1065353216.0) / 8388608.0 + 1.0)"),
+     lambda ctx,x: f"(mod({ctx[x.src[0]]}, 8388608.0) / 8388608.0 + 1.0)"),
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: ctx[x.src[0]]),
 
     # Boolean ops via float

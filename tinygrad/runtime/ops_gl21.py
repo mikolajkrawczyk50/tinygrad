@@ -138,21 +138,21 @@ class GL21Program(Program['GL21Device']):
     self.dev.ctx.viewport = (0, 0, render_target.width, render_target.height)
 
     vertices = self.num_pts if self.render_mode == moderngl.POINTS else 6
+    elapsed = None
     if wait:
       with self.dev.ctx.query(time=True) as q:
         self.vao.render(self.render_mode, vertices=vertices)
         self.dev.ctx.finish()
-      if use_temp_output:
-        self.dev.ctx.copy_framebuffer(output_tex, fbo)
-        temp_output_tex.release()
-      return q.elapsed / 1e9
+      elapsed = q.elapsed / 1e9
+    else:
+      self.vao.render(self.render_mode, vertices=vertices)
+      self.dev.ctx.finish()
 
-    self.vao.render(self.render_mode, vertices=vertices)
-    self.dev.ctx.finish()
     if use_temp_output:
       self.dev.ctx.copy_framebuffer(output_tex, fbo)
       temp_output_tex.release()
-    return None
+    fbo.release()
+    return elapsed
 
 
 import inspect
@@ -252,9 +252,11 @@ class GL21Allocator(Allocator['GL21Device']):
       converted = floats[float_offset : float_offset + dest.nbytes // 4].astype(np.uint32).tobytes()
     elif dt in (dtypes.int64, dtypes.long) or dest.format in ('q', 'Q'):
       converted = floats[float_offset : float_offset + dest.nbytes // 8].astype(np.int64).tobytes()
+    elif dt in (dtypes.float64, dtypes.double) or dest.format == 'd':
+      converted = floats[float_offset : float_offset + dest.nbytes // 8].astype(np.float64).tobytes()
     else:
       converted = floats[float_offset : float_offset + dest.nbytes // 4].astype(np.float32).tobytes()
-    dest[:] = converted[:dest.nbytes]
+    dest.cast('B')[:] = converted[:dest.nbytes]
 
 
 def _create_x11_glx_context() -> tuple[moderngl.Context, Any]:
@@ -421,6 +423,7 @@ _jit_orig: Any = getattr(TinyJit, "_jit_orig", cast(Any, TinyJit).__call__)
 _softmax_orig = getattr(OpMixin, "_softmax_orig", getattr(OpMixin, "softmax", None))
 _log_softmax_orig = getattr(OpMixin, "_log_softmax_orig", getattr(OpMixin, "log_softmax", None))
 _cross_entropy_orig = getattr(OpMixin, "_cross_entropy_orig", getattr(OpMixin, "cross_entropy", None))
+_sparse_ce_orig = getattr(OpMixin, "_sparse_ce_orig", getattr(OpMixin, "sparse_categorical_crossentropy", None))
 _rand_internal_orig = getattr(RandMixin, "_rand_internal_orig", getattr(RandMixin, "_rand", None))
 _rand_orig = getattr(RandMixin, "_rand_orig", getattr(RandMixin, "rand", None))
 _randn_orig = getattr(RandMixin, "_randn_orig", getattr(RandMixin, "randn", None))
@@ -524,13 +527,28 @@ def _cross_entropy_gl21(self, Y, reduction="mean", label_smoothing=0.0):
     # Match original implementation: uses _one_hot_along_dim
     assert 0.0 <= label_smoothing <= 1.0, "label_smoothing must be in [0.0, 1.0]"
     classes_dim = 0 if self.ndim == 1 else 1
-    if self.shape != Y.shape:
-      if self.max(classes_dim).shape != Y.shape: raise RuntimeError(f"shape mismatch: {self.shape=}, {Y.shape=}")
-      Y = Y.unsqueeze(classes_dim)._one_hot_along_dim(num_classes=self.shape[classes_dim], dim=classes_dim)
+    x = self
+    if x.shape != Y.shape:
+      if x.max(classes_dim).shape != Y.shape: raise RuntimeError(f"shape mismatch: {x.shape=}, {Y.shape=}")
+      Y = Y.unsqueeze(classes_dim)._one_hot_along_dim(num_classes=x.shape[classes_dim], dim=classes_dim)
     Y = (1 - label_smoothing)*Y + label_smoothing / int(Y.shape[classes_dim])
-    return -self.log_softmax(classes_dim).mul(Y).sum(classes_dim)._do_reduction(reduction)
+    return -x.log_softmax(classes_dim).mul(Y).sum(classes_dim)._do_reduction(reduction)
   if _cross_entropy_orig is not None: return _cross_entropy_orig(self, Y, reduction, label_smoothing)
   return self.cross_entropy(Y, reduction, label_smoothing)
+
+def _sparse_categorical_crossentropy_gl21(self, Y, ignore_index:int=-1, label_smoothing=0.0, reduction="mean"):
+  dev = getattr(self, "device", None) or Device.DEFAULT
+  if str(dev).startswith("GL21") or Device.DEFAULT.startswith("GL21"):
+    assert 0.0 <= label_smoothing <= 1.0, "label_smoothing must be in [0.0, 1.0]"
+    x = self
+    log_probs = x.log_softmax()
+    loss_mask = Y.ne(ignore_index) if ignore_index != -1 else Y.const_like(True, dtypes.bool)
+    y = Y.unsqueeze(-1)._one_hot_along_dim(x.shape[-1], dim=-1) * loss_mask.unsqueeze(-1)
+    smoothing = label_smoothing * (log_probs.mean(-1) * loss_mask)
+    unreduced = ((1 - label_smoothing) * (log_probs * y).sum(-1) + smoothing)
+    return -unreduced.sum() / loss_mask.sum() if reduction == "mean" else -unreduced._do_reduction(reduction)
+  if _sparse_ce_orig is not None: return _sparse_ce_orig(self, Y, ignore_index, label_smoothing, reduction)
+  return self.sparse_categorical_crossentropy(Y, ignore_index, label_smoothing, reduction)
 
 def _rand_internal_gl21(cls, key, counter, shape, dtype, contiguous=True):
   dev = canonicalize_device(Device.DEFAULT)
@@ -607,6 +625,8 @@ if _log_softmax_orig or hasattr(OpMixin, "log_softmax"):
   setattr(OpMixin, "log_softmax", _log_softmax_gl21)
 if _cross_entropy_orig or hasattr(OpMixin, "cross_entropy"):
   setattr(OpMixin, "cross_entropy", _cross_entropy_gl21)
+if _sparse_ce_orig or hasattr(OpMixin, "sparse_categorical_crossentropy"):
+  setattr(OpMixin, "sparse_categorical_crossentropy", _sparse_categorical_crossentropy_gl21)
 from tinygrad.tensor import Tensor
 from tinygrad.mixin.creation import CreationMixin
 
@@ -667,6 +687,8 @@ if _log_softmax_orig or hasattr(Tensor, "log_softmax"):
   setattr(Tensor, "log_softmax", _log_softmax_gl21)
 if _cross_entropy_orig or hasattr(Tensor, "cross_entropy"):
   setattr(Tensor, "cross_entropy", _cross_entropy_gl21)
+if _sparse_ce_orig or hasattr(Tensor, "sparse_categorical_crossentropy"):
+  setattr(Tensor, "sparse_categorical_crossentropy", _sparse_categorical_crossentropy_gl21)
 
 # Engine runtime hooks (keeps core tinygrad engine completely unmodified)
 try:

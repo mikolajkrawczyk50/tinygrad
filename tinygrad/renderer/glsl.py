@@ -5,6 +5,35 @@ from tinygrad.renderer.cstyle import CStyleLanguage, base_rewrite
 from tinygrad.helpers import strip_parens, prod
 from tinygrad.device import Compiler
 
+def _extract_hi_lo_str(ctx, u: UOp) -> tuple[str, str]:
+  if u.op is Ops.CONST:
+    val = int(u.arg)
+    hi_val = (val >> 32) & 0xFFFFFFFF
+    lo_val = val & 0xFFFFFFFF
+    return f"vec2({hi_val & 0xFFFF}.0, {(hi_val >> 16) & 0xFFFF}.0)", f"vec2({lo_val & 0xFFFF}.0, {(lo_val >> 16) & 0xFFFF}.0)"
+  if u.op is Ops.OR:
+    if u.src[0].op is Ops.SHL: hi, lo = u.src[0].src[0], u.src[1]
+    elif u.src[1].op is Ops.SHL: hi, lo = u.src[1].src[0], u.src[0]
+    else: hi, lo = u.src[0], u.src[1]
+  else:
+    hi, lo = u.alu(Ops.SHR, u.const_like(32)), u.cast(dtypes.uint32)
+  if hi.op is Ops.CAST: hi = hi.src[0]
+  if lo.op is Ops.CAST: lo = lo.src[0]
+  def to_vec2_str(x):
+    if x.op is Ops.CONST:
+      v = int(x.arg)
+      return f"vec2({v & 0xFFFF}.0, {(v >> 16) & 0xFFFF}.0)"
+    if x.dtype in (dtypes.uint32, dtypes.int32, dtypes.uint64, dtypes.int64):
+      return str(ctx[x])
+    return f"_to_u32({ctx[x]})"
+  return to_vec2_str(hi), to_vec2_str(lo)
+
+def _as_float(ctx, u: UOp) -> str:
+  if u.dtype in (dtypes.uint32, dtypes.int32, dtypes.uint64, dtypes.int64):
+    if u.op is Ops.CONST: return f"{int(u.arg)}.0"
+    return f"({ctx[u]}.x + {ctx[u]}.y * 65536.0)"
+  return str(ctx[u])
+
 def _match_paren(s:str, i:int) -> tuple[int, str]:
   depth = 0
   for j in range(i, len(s)):
@@ -524,27 +553,70 @@ class GL21Renderer(MGLRenderer):
     Ops.AND: lambda a, b, dtype: f"_bit_and({a}, {b})",
     Ops.OR: lambda a, b, dtype: f"_bit_or({a}, {b})",
     Ops.XOR: lambda a, b, dtype: f"_bit_xor({a}, {b})",
+    Ops.THREEFRY: lambda a, b, dtype: f"_threefry_u32_0({a}, {b})",
   }
 
   # GLSL 1.20 string rewrites
   string_rewrite = PatternMatcher([
+    # Threefry rewrite
+    # Threefry rewrite
+    (UPat(Ops.CAST, dtype=(dtypes.uint32, dtypes.uint64),
+          src=(UPat(Ops.SHR, src=(UPat(Ops.THREEFRY, src=(UPat.var('x'), UPat.var('k'))), UPat())),)),
+     lambda ctx, x, k: (c:=_extract_hi_lo_str(ctx, x), key:=_extract_hi_lo_str(ctx, k),
+                        f"_threefry_u32_1({c[1]}, {c[0]}, {key[1]}, {key[0]})")[-1]),
+    (UPat(Ops.CAST, dtype=(dtypes.uint32, dtypes.uint64),
+          src=(UPat(Ops.THREEFRY, src=(UPat.var('x'), UPat.var('k'))),)),
+     lambda ctx, x, k: (c:=_extract_hi_lo_str(ctx, x), key:=_extract_hi_lo_str(ctx, k),
+                        f"_threefry_u32_0({c[1]}, {c[0]}, {key[1]}, {key[0]})")[-1]),
+    (UPat(Ops.SHR, src=(UPat(Ops.THREEFRY, src=(UPat.var('x'), UPat.var('k'))), UPat()), name='s'),
+     lambda ctx, x, k, s: (c:=_extract_hi_lo_str(ctx, x), key:=_extract_hi_lo_str(ctx, k),
+                           f"_threefry_u32_1({c[1]}, {c[0]}, {key[1]}, {key[0]})")[-1]),
+    (UPat(Ops.THREEFRY, src=(UPat.var('x'), UPat.var('k')), name='tf'),
+     lambda ctx, x, k, tf: (c:=_extract_hi_lo_str(ctx, x), key:=_extract_hi_lo_str(ctx, k),
+                            f"_threefry_u32_0({c[1]}, {c[0]}, {key[1]}, {key[0]})")[-1]),
+
+    # 32-bit integer arithmetic (vec2) for uint32/uint64
+    (UPat(Ops.CONST, dtype=(dtypes.uint32, dtypes.uint64), name="x"),
+     lambda ctx,x: f"vec2({int(x.val) & 0xFFFF}.0, {(int(x.val) >> 16) & 0xFFFF}.0)"),
+    (UPat(Ops.ADD, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("a"), UPat.var("b"))),
+     lambda ctx,a,b: f"_u32_add({ctx[a]}, {ctx[b]})"),
+    (UPat(Ops.SUB, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("a"), UPat.var("b"))),
+     lambda ctx,a,b: f"_u32_sub({ctx[a]}, {ctx[b]})"),
+    (UPat(Ops.SHR, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("a"), UPat.var("b"))),
+     lambda ctx,a,b: f"_u32_shr({ctx[a]}, {ctx[b]}.x)"),
+    (UPat(Ops.SHL, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("a"), UPat.var("b"))),
+     lambda ctx,a,b: f"_u32_shl({ctx[a]}, {ctx[b]}.x)"),
+    (UPat(Ops.AND, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("a"), UPat.var("b"))),
+     lambda ctx,a,b: f"_u32_and({ctx[a]}, {ctx[b]})"),
+    (UPat(Ops.OR, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("a"), UPat.var("b"))),
+     lambda ctx,a,b: f"_u32_or({ctx[a]}, {ctx[b]})"),
+    (UPat(Ops.XOR, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("a"), UPat.var("b"))),
+     lambda ctx,a,b: f"_u32_xor({ctx[a]}, {ctx[b]})"),
+    (UPat(Ops.CMPLT, dtype=dtypes.bool, src=(UPat.var("a", (dtypes.uint32, dtypes.uint64)), UPat.var("b", (dtypes.uint32, dtypes.uint64)))),
+     lambda ctx,a,b: f"float(_u32_cmplt({ctx[a]}, {ctx[b]}))"),
+    (UPat(Ops.CMPEQ, dtype=dtypes.bool, src=(UPat.var("a", (dtypes.uint32, dtypes.uint64)), UPat.var("b", (dtypes.uint32, dtypes.uint64)))),
+     lambda ctx,a,b: f"float(({ctx[a]}.x == {ctx[b]}.x) && ({ctx[a]}.y == {ctx[b]}.y))"),
+    (UPat(Ops.CMPNE, dtype=dtypes.bool, src=(UPat.var("a", (dtypes.uint32, dtypes.uint64)), UPat.var("b", (dtypes.uint32, dtypes.uint64)))),
+     lambda ctx,a,b: f"float(({ctx[a]}.x != {ctx[b]}.x) || ({ctx[a]}.y != {ctx[b]}.y))"),
+    (UPat(Ops.WHERE, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("c"), UPat.var("t"), UPat.var("f"))),
+     lambda ctx,c,t,f: f"(bool({ctx[c]}) ? {ctx[t]} : {ctx[f]})"),
+
     # Constants
     (UPat(Ops.CONST, dtype=dtypes.bool, name="x"), lambda ctx,x: "1.0" if x.val else "0.0"),
     (UPat(Ops.CONST, dtype=dtypes.float, name="x"), lambda ctx,x: "INFINITY" if x.val == float('inf') else (
       "-INFINITY" if x.val == float('-inf') else ("NAN" if x.val != x.val else f"{x.val}"))),
-    (UPat(Ops.CONST, dtype=dtypes.int32, name="x"), lambda ctx,x: f"{x.val}.0"),
-    (UPat(Ops.CONST, dtype=dtypes.uint32, name="x"), lambda ctx,x: f"{x.val}.0"),
-    (UPat(Ops.CONST, dtype=dtypes.int64, name="x"), lambda ctx,x: f"{x.val}.0"),
-    (UPat(Ops.CONST, dtype=dtypes.uint64, name="x"), lambda ctx,x: f"{x.val}.0"),
+    (UPat(Ops.CONST, dtype=(dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int64, dtypes.uint8, dtypes.uint16), name="x"),
+     lambda ctx,x: f"{x.val}.0"),
 
     # Bitcast - float bitcast from uint mantissa emulation and identity for int<->uint
-    (UPat(Ops.BITCAST, dtype=dtypes.float, name="x"),
-     lambda ctx,x: f"(mod({ctx[x.src[0]]}, 8388608.0) / 8388608.0 + 1.0)"),
+    (UPat(Ops.BITCAST, dtype=dtypes.float, src=(UPat.var("a", (dtypes.uint32, dtypes.uint64)),)),
+     lambda ctx,a: f"((({ctx[a]}.x + mod({ctx[a]}.y, 128.0) * 65536.0) / 8388608.0) + 1.0)"),
+    (UPat(Ops.BITCAST, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("a", (dtypes.uint32, dtypes.uint64)),)),
+     lambda ctx,a: ctx[a]),
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: ctx[x.src[0]]),
 
     # Cast to integer dtypes (float truncation) and bool
-    (UPat(Ops.CAST, dtype=(dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int64,
-                           dtypes.uint8, dtypes.uint16, dtypes.uint32, dtypes.uint64), name="x"),
+    (UPat(Ops.CAST, dtype=(dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int64, dtypes.uint8, dtypes.uint16), name="x"),
      lambda ctx,x: f"(floor(abs({ctx[x.src[0]]})) * sign({ctx[x.src[0]]}))"),
     (UPat(Ops.CAST, dtype=dtypes.bool, name="x"),
      lambda ctx,x: f"float(({ctx[x.src[0]]}) != 0.0)"),
@@ -571,23 +643,33 @@ class GL21Renderer(MGLRenderer):
      lambda ctx,c,t,f,x: f"(bool({ctx[c]}) ? {ctx[t]} : {ctx[f]})"),
 
     # Load/Store via texture2D with index-derived coordinates (GLOBAL buffers = textures)
-    (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat(Ops.ADD, src=(UPat.var("a"), UPat.var("c")))), name="bidx"),), name="x"),
-     lambda ctx,b,a,c,bidx,x: (f"texture2D({ctx[b]}, _coord_add(float({ctx[a]}), float({ctx[c]}), {ctx[b]}_tex_size)).r"
+    (UPat(Ops.LOAD, dtype=(dtypes.uint32, dtypes.uint64),
+          src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat(Ops.ADD, src=(UPat.var("a"), UPat.var("c")))), name="bidx"),), name="x"),
+     lambda ctx,b,a,c,bidx,x: (f"texture2D({ctx[b]}, _coord_add(float({ctx[a]}), float({ctx[c]}), {ctx[b]}_tex_size)).rg"
                                if b.addrspace == AddrSpace.GLOBAL else f"({ctx[b]}[int(({ctx[a]})+({ctx[c]}))])")),
-    (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat(Ops.ADD, src=(UPat.var("a"), UPat.var("c")))), name="bidx"),
-                         UPat.var("v"), UPat.var("gate")), name="x"),
-     lambda ctx,b,a,c,bidx,v,gate,x: f"(bool({ctx[gate]}) ? " + (
-       f"texture2D({ctx[b]}, _coord_add(float({ctx[a]}), float({ctx[c]}), {ctx[b]}_tex_size)).r" if b.addrspace == AddrSpace.GLOBAL else (
-         f"({ctx[b]}[int(({ctx[a]})+({ctx[c]}))])")) + f" : {ctx[v]})"),
+    (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat(Ops.ADD, src=(UPat.var("a"), UPat.var("c")))), name="bidx"),), name="x"),
+     lambda ctx,b,a,c,bidx,x: (f"_tex_read(texture2D({ctx[b]}, _coord_add(float({ctx[a]}), float({ctx[c]}), {ctx[b]}_tex_size)))"
+                               if b.addrspace == AddrSpace.GLOBAL else f"({ctx[b]}[int(({ctx[a]})+({ctx[c]}))])")),
+    (UPat(Ops.LOAD, dtype=(dtypes.uint32, dtypes.uint64),
+          src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat.var("idx")), name="bidx"),), name="x"),
+     lambda ctx,b,idx,bidx,x: (f"texture2D({ctx[b]}, _coord(float({ctx[idx]}), {ctx[b]}_tex_size)).rg"
+                               if b.addrspace == AddrSpace.GLOBAL else f"({ctx[b]}[int({ctx[idx]})])")),
     (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat.var("idx")), name="bidx"),), name="x"),
-     lambda ctx,b,idx,bidx,x: f"texture2D({ctx[b]}, _coord(float({ctx[idx]}), {ctx[b]}_tex_size)).r" if b.addrspace == AddrSpace.GLOBAL else (
-       f"({ctx[b]}[int({ctx[idx]})])")),
+     lambda ctx,b,idx,bidx,x: (f"_tex_read(texture2D({ctx[b]}, _coord(float({ctx[idx]}), {ctx[b]}_tex_size)))"
+                               if b.addrspace == AddrSpace.GLOBAL else f"({ctx[b]}[int({ctx[idx]})])")),
     (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat.var("idx")), name="bidx"), UPat.var("v"), UPat.var("gate")), name="x"),
      lambda ctx,b,idx,bidx,v,gate,x: f"(bool({ctx[gate]}) ? " + (
-       f"texture2D({ctx[b]}, _coord(float({ctx[idx]}), {ctx[b]}_tex_size)).r" if b.addrspace == AddrSpace.GLOBAL else (
+       f"_tex_read(texture2D({ctx[b]}, _coord(float({ctx[idx]}), {ctx[b]}_tex_size)))" if b.addrspace == AddrSpace.GLOBAL else (
          f"({ctx[b]}[int({ctx[idx]})])")) + f" : {ctx[v]})"),
+    (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat.var("idx")), name="bidx"),
+                          UPat.var("v", (dtypes.uint32, dtypes.uint64))), name="x"),
+     lambda ctx,b,idx,bidx,v,x: f"gl_FragColor.rg = {ctx[v]};" if b.addrspace == AddrSpace.GLOBAL else f"{ctx[b]}[int({ctx[idx]})] = {ctx[v]};"),
     (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat.var("idx")), name="bidx"), UPat.var("v")), name="x"),
      lambda ctx,b,idx,bidx,v,x: f"gl_FragColor.r = {ctx[v]};" if b.addrspace == AddrSpace.GLOBAL else f"{ctx[b]}[int({ctx[idx]})] = {ctx[v]};"),
+    (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat.var("idx")), name="bidx"),
+                          UPat.var("v", (dtypes.uint32, dtypes.uint64)), UPat.var("gate")), name="x"),
+     lambda ctx,b,idx,bidx,v,gate,x: f"if (bool({ctx[gate]})) " + (
+       f"gl_FragColor.rg = {ctx[v]};" if b.addrspace == AddrSpace.GLOBAL else f"{ctx[b]}[int({ctx[idx]})] = {ctx[v]};")),
     (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat.var("b"), UPat.var("idx")), name="bidx"), UPat.var("v"), UPat.var("gate")), name="x"),
      lambda ctx,b,idx,bidx,v,gate,x: f"if (bool({ctx[gate]})) " + (
        f"gl_FragColor.r = {ctx[v]};" if b.addrspace == AddrSpace.GLOBAL else f"{ctx[b]}[int({ctx[idx]})] = {ctx[v]};")),
@@ -596,12 +678,12 @@ class GL21Renderer(MGLRenderer):
     (UPat(Ops.IF, name="x"), lambda ctx,x: f"if (bool({ctx[x.src[0]]})) {{"),
 
     # Fallback LOAD/STORE
-    (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("v"), UPat.var("gate")), name="x"),
-     lambda ctx,bidx,v,gate,x: f"(bool({ctx[gate]}) ? texture2D({ctx[bidx]}, tex_coord).r : {ctx[v]})"),
+    (UPat(Ops.LOAD, dtype=(dtypes.uint32, dtypes.uint64), src=(UPat.var("bidx"),), name="x"),
+     lambda ctx,bidx,x: f"texture2D({ctx[bidx]}, tex_coord).rg"),
     (UPat(Ops.LOAD, src=(UPat.var("bidx"),), name="x"),
-     lambda ctx,bidx,x: f"texture2D({ctx[bidx]}, tex_coord).r"),
-    (UPat(Ops.STORE, src=(UPat.var("bidx"), UPat.var("v"), UPat.var("gate")), name="x"),
-     lambda ctx,bidx,v,gate,x: f"if (bool({ctx[gate]})) gl_FragColor.r = {ctx[v]};"),
+     lambda ctx,bidx,x: f"_tex_read(texture2D({ctx[bidx]}, tex_coord))"),
+    (UPat(Ops.STORE, src=(UPat.var("bidx"), UPat.var("v", (dtypes.uint32, dtypes.uint64))), name="x"),
+     lambda ctx,bidx,v,x: f"gl_FragColor.rg = {ctx[v]};"),
     (UPat(Ops.STORE, src=(UPat.var("bidx"), UPat.var("v")), name="x"),
      lambda ctx,bidx,v,x: f"gl_FragColor.r = {ctx[v]};"),
 
@@ -627,10 +709,19 @@ class GL21Renderer(MGLRenderer):
   ]) + base_rewrite
 
   def render_type(self, u: UOp) -> str:
-    return "float"  # Everything is float in GLSL 1.20
+    if u.dtype in (dtypes.uint32, dtypes.uint64):
+      return "vec2"
+    return "float"
 
   def render_cast(self, u: UOp, val: str) -> str:
-    return val  # No-op casts in GLSL 1.20
+    if u.dtype in (dtypes.uint32, dtypes.uint64):
+      if u.src[0].dtype in (dtypes.uint32, dtypes.uint64):
+        return val
+      return f"_to_u32({val})"
+    elif u.dtype == dtypes.float:
+      if u.src[0].dtype in (dtypes.uint32, dtypes.uint64):
+        return f"({val}.x + {val}.y * 65536.0)"
+    return val
 
   def render(self, uops: list[UOp]) -> str:
     # Compute output_range_map BEFORE _render (which does pattern matching)
@@ -728,13 +819,155 @@ class GL21Renderer(MGLRenderer):
     frag += "  }\n"
     frag += "  return r;\n"
     frag += "}\n"
+    frag += "float _tex_read(vec4 t) {\n"
+    frag += "  return t.r;\n"
+    frag += "}\n"
+    frag += "vec2 _to_u32(float v) {\n"
+    frag += "  return (v >= 65536.0) ? vec2(mod(v, 65536.0), floor(v / 65536.0)) : vec2(v, 0.0);\n"
+    frag += "}\n"
+    frag += "vec2 _u32_add(vec2 a, vec2 b) {\n"
+    frag += "  float s_lo = a.x + b.x;\n"
+    frag += "  float c = floor(s_lo / 65536.0);\n"
+    frag += "  float r_lo = s_lo - c * 65536.0;\n"
+    frag += "  float s_hi = a.y + b.y + c;\n"
+    frag += "  float c_hi = floor(s_hi / 65536.0);\n"
+    frag += "  float r_hi = s_hi - c_hi * 65536.0;\n"
+    frag += "  return vec2(r_lo, r_hi);\n"
+    frag += "}\n"
+    frag += "vec2 _u32_sub(vec2 a, vec2 b) {\n"
+    frag += "  float b_lo = (a.x < b.x) ? 1.0 : 0.0;\n"
+    frag += "  float r_lo = a.x - b.x + b_lo * 65536.0;\n"
+    frag += "  float r_hi = mod(a.y - b.y - b_lo + 65536.0, 65536.0);\n"
+    frag += "  return vec2(r_lo, r_hi);\n"
+    frag += "}\n"
+    frag += "bool _u32_cmplt(vec2 a, vec2 b) {\n"
+    frag += "  return (a.y < b.y) || (a.y == b.y && a.x < b.x);\n"
+    frag += "}\n"
+    frag += "float _and16(float a, float b) {\n"
+    frag += "  float r = 0.0; float p = 1.0;\n"
+    frag += "  for (int i = 0; i < 16; i++) {\n"
+    frag += "    float ma = mod(a, 2.0); float mb = mod(b, 2.0);\n"
+    frag += "    if (ma >= 1.0 && mb >= 1.0) r += p;\n"
+    frag += "    a = floor(a / 2.0); b = floor(b / 2.0); p *= 2.0;\n"
+    frag += "    if (a == 0.0 || b == 0.0) break;\n"
+    frag += "  }\n"
+    frag += "  return r;\n"
+    frag += "}\n"
+    frag += "float _or16(float a, float b) {\n"
+    frag += "  float r = 0.0; float p = 1.0;\n"
+    frag += "  for (int i = 0; i < 16; i++) {\n"
+    frag += "    float ma = mod(a, 2.0); float mb = mod(b, 2.0);\n"
+    frag += "    if (ma >= 1.0 || mb >= 1.0) r += p;\n"
+    frag += "    a = floor(a / 2.0); b = floor(b / 2.0); p *= 2.0;\n"
+    frag += "    if (a == 0.0 && b == 0.0) break;\n"
+    frag += "  }\n"
+    frag += "  return r;\n"
+    frag += "}\n"
+    frag += "vec2 _u32_and(vec2 a, vec2 b) {\n"
+    frag += "  return vec2(_and16(a.x, b.x), _and16(a.y, b.y));\n"
+    frag += "}\n"
+    frag += "vec2 _u32_or(vec2 a, vec2 b) {\n"
+    frag += "  return vec2(_or16(a.x, b.x), _or16(a.y, b.y));\n"
+    frag += "}\n"
+    frag += "vec2 _u32_shl(vec2 a, float s) {\n"
+    frag += "  if (s == 0.0) return a;\n"
+    frag += "  if (s < 16.0) {\n"
+    frag += "    float p2 = exp2(s); float p2_c = exp2(16.0 - s);\n"
+    frag += "    float r_lo = mod(a.x * p2, 65536.0);\n"
+    frag += "    float r_hi = mod(a.y * p2 + floor(a.x / p2_c), 65536.0);\n"
+    frag += "    return vec2(r_lo, r_hi);\n"
+    frag += "  } else {\n"
+    frag += "    float s_prime = s - 16.0; float p2 = exp2(s_prime);\n"
+    frag += "    return vec2(0.0, mod(a.x * p2, 65536.0));\n"
+    frag += "  }\n"
+    frag += "}\n"
+    frag += "vec2 _u32_shr(vec2 a, float s) {\n"
+    frag += "  if (s == 0.0) return a;\n"
+    frag += "  if (s < 16.0) {\n"
+    frag += "    float p2 = exp2(s); float p2_c = exp2(16.0 - s);\n"
+    frag += "    float r_lo = floor(a.x / p2) + mod(a.y, p2) * p2_c;\n"
+    frag += "    float r_hi = floor(a.y / p2);\n"
+    frag += "    return vec2(r_lo, r_hi);\n"
+    frag += "  } else {\n"
+    frag += "    float s_prime = s - 16.0; float p2 = exp2(s_prime);\n"
+    frag += "    return vec2(floor(a.y / p2), 0.0);\n"
+    frag += "  }\n"
+    frag += "}\n"
+    frag += "vec2 _u32_xor(vec2 a, vec2 b) {\n"
+    frag += "  vec2 r = vec2(0.0, 0.0);\n"
+    frag += "  float p = 1.0;\n"
+    frag += "  for (int i = 0; i < 16; i++) {\n"
+    frag += "    vec2 ma = mod(a, 2.0); vec2 mb = mod(b, 2.0);\n"
+    frag += "    r += vec2((ma.x >= 1.0) != (mb.x >= 1.0) ? p : 0.0, (ma.y >= 1.0) != (mb.y >= 1.0) ? p : 0.0);\n"
+    frag += "    a = floor(a * 0.5); b = floor(b * 0.5); p *= 2.0;\n"
+    frag += "    if (a.x == 0.0 && a.y == 0.0 && b.x == 0.0 && b.y == 0.0) break;\n"
+    frag += "  }\n"
+    frag += "  return r;\n"
+    frag += "}\n"
+    frag += "vec2 _u32_rotl(vec2 a, float r) {\n"
+    frag += "  if (r == 16.0) return vec2(a.y, a.x);\n"
+    frag += "  if (r < 16.0) {\n"
+    frag += "    float p2 = exp2(r); float p2_c = exp2(16.0 - r);\n"
+    frag += "    float hi_x = floor(a.x / p2_c); float lo_x = a.x - hi_x * p2_c;\n"
+    frag += "    float hi_y = floor(a.y / p2_c); float lo_y = a.y - hi_y * p2_c;\n"
+    frag += "    return vec2(lo_x * p2 + hi_y, lo_y * p2 + hi_x);\n"
+    frag += "  } else {\n"
+    frag += "    float r_prime = r - 16.0;\n"
+    frag += "    float p2 = exp2(r_prime); float p2_c = exp2(16.0 - r_prime);\n"
+    frag += "    float hi_x = floor(a.x / p2_c); float lo_x = a.x - hi_x * p2_c;\n"
+    frag += "    float hi_y = floor(a.y / p2_c); float lo_y = a.y - hi_y * p2_c;\n"
+    frag += "    return vec2(lo_y * p2 + hi_x, lo_x * p2 + hi_y);\n"
+    frag += "  }\n"
+    frag += "}\n"
+    frag += "vec4 _threefry2x32(vec2 x0, vec2 x1, vec2 k0, vec2 k1) {\n"
+    frag += "  vec2 c_const = vec2(7130.0, 7121.0);\n"
+    frag += "  vec2 ks0 = k1;\n"
+    frag += "  vec2 ks1 = _u32_xor(_u32_xor(k0, k1), c_const);\n"
+    frag += "  vec2 ks2 = k0;\n"
+    frag += "  vec2 xr0 = _u32_add(x0, ks2);\n"
+    frag += "  vec2 xr1 = _u32_add(x1, ks0);\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 13.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 15.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 26.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 6.0));\n"
+    frag += "  xr0 = _u32_add(xr0, ks0); xr1 = _u32_add(xr1, _u32_add(ks1, vec2(1.0, 0.0)));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 17.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 29.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 16.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 24.0));\n"
+    frag += "  xr0 = _u32_add(xr0, ks1); xr1 = _u32_add(xr1, _u32_add(ks2, vec2(2.0, 0.0)));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 13.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 15.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 26.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 6.0));\n"
+    frag += "  xr0 = _u32_add(xr0, ks2); xr1 = _u32_add(xr1, _u32_add(ks0, vec2(3.0, 0.0)));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 17.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 29.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 16.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 24.0));\n"
+    frag += "  xr0 = _u32_add(xr0, ks0); xr1 = _u32_add(xr1, _u32_add(ks1, vec2(4.0, 0.0)));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 13.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 15.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 26.0));\n"
+    frag += "  xr0 = _u32_add(xr0, xr1); xr1 = _u32_xor(xr0, _u32_rotl(xr1, 6.0));\n"
+    frag += "  xr0 = _u32_add(xr0, ks1); xr1 = _u32_add(xr1, _u32_add(ks2, vec2(5.0, 0.0)));\n"
+    frag += "  return vec4(xr0.x, xr0.y, xr1.x, xr1.y);\n"
+    frag += "}\n"
+    frag += "vec2 _threefry_u32_0(vec2 c0, vec2 c1, vec2 k0, vec2 k1) {\n"
+    frag += "  vec4 tf = _threefry2x32(c0, c1, k0, k1);\n"
+    frag += "  return tf.xy;\n"
+    frag += "}\n"
+    frag += "vec2 _threefry_u32_1(vec2 c0, vec2 c1, vec2 k0, vec2 k1) {\n"
+    frag += "  vec4 tf = _threefry2x32(c0, c1, k0, k1);\n"
+    frag += "  return tf.zw;\n"
+    frag += "}\n"
 
     # Texture uniforms (sampler2D)
     for i, (name, u, _) in enumerate(textures):
       frag += f"uniform sampler2D {name};\n"
-      # Per-buffer texture size uniforms
+      # Per-buffer texture size constants
       w, h = buffer_tex_sizes[name]
-      frag += f"uniform vec2 {name}_tex_size;\n"
+      frag += f"const vec2 {name}_tex_size = vec2({float(w)}, {float(h)});\n"
 
     # ALU uniforms (individual float uniforms for each param)
     if uniforms:
@@ -748,12 +981,7 @@ class GL21Renderer(MGLRenderer):
     frag += "  return vec2((x + 0.5) / sz.x, (y + 0.5) / sz.y);\n"
     frag += "}\n"
     frag += "vec2 _coord_add(float a, float b, vec2 sz) {\n"
-    frag += "  float ay = floor((a + 0.1) / sz.x);\n"
-    frag += "  float ax = floor(a - ay * sz.x + 0.1);\n"
-    frag += "  float total_x = ax + b;\n"
-    frag += "  float y = ay + floor((total_x + 0.1) / sz.x);\n"
-    frag += "  float x = floor(total_x - floor((total_x + 0.1) / sz.x) * sz.x + 0.1);\n"
-    frag += "  return vec2((x + 0.5) / sz.x, (y + 0.5) / sz.y);\n"
+    frag += "  return _coord(a + b, sz);\n"
     frag += "}\n"
 
     # Coordinate decoding - compute logical output indices from flat_id
@@ -901,10 +1129,13 @@ class GL21Renderer(MGLRenderer):
       frag += "  }\n"
       frag += "  return r;\n"
       frag += "}\n"
+      frag += "float _tex_read(vec4 c) {\n"
+      frag += "  return (abs(c.g) > 0.0) ? (c.r + c.g * 65536.0) : c.r;\n"
+      frag += "}\n"
       for i, (name, u, _) in enumerate(textures):
         frag += f"uniform sampler2D {name};\n"
         w, h = buffer_tex_sizes[name]
-        frag += f"uniform vec2 {name}_tex_size;\n"
+        frag += f"const vec2 {name}_tex_size = vec2({w}.0, {h}.0);\n"
       if uniforms:
         for name, u, _ in uniforms:
           frag += f"uniform float {name};\n"
@@ -914,12 +1145,7 @@ class GL21Renderer(MGLRenderer):
       frag += "  return vec2((x + 0.5) / sz.x, (y + 0.5) / sz.y);\n"
       frag += "}\n"
       frag += "vec2 _coord_add(float a, float b, vec2 sz) {\n"
-      frag += "  float ay = floor((a + 0.1) / sz.x);\n"
-      frag += "  float ax = floor(a - ay * sz.x + 0.1);\n"
-      frag += "  float total_x = ax + b;\n"
-      frag += "  float y = ay + floor((total_x + 0.1) / sz.x);\n"
-      frag += "  float x = floor(total_x - floor((total_x + 0.1) / sz.x) * sz.x + 0.1);\n"
-      frag += "  return vec2((x + 0.5) / sz.x, (y + 0.5) / sz.y);\n"
+      frag += "  return _coord(a + b, sz);\n"
       frag += "}\n"
       frag_coord_decls = ["  int _flat_id = int(v_flat_id);"] + coord_decls[1:]
       body = frag_coord_decls + coord_setup + hoist_complex_float(kernel)

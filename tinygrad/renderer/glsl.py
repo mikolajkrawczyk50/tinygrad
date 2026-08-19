@@ -981,7 +981,15 @@ class GL21Renderer(MGLRenderer):
     frag += "  return vec2((x + 0.5) / sz.x, (y + 0.5) / sz.y);\n"
     frag += "}\n"
     frag += "vec2 _coord_add(float a, float b, vec2 sz) {\n"
-    frag += "  return _coord(a + b, sz);\n"
+    frag += "  float ya = floor((a + 0.1) / sz.x);\n"
+    frag += "  float rema = floor(a - ya * sz.x + 0.1);\n"
+    frag += "  float yb = floor((b + 0.1) / sz.x);\n"
+    frag += "  float remb = floor(b - yb * sz.x + 0.1);\n"
+    frag += "  float rem = rema + remb;\n"
+    frag += "  float yextra = floor((rem + 0.1) / sz.x);\n"
+    frag += "  float y = ya + yb + yextra;\n"
+    frag += "  float x = floor(rem - yextra * sz.x + 0.1);\n"
+    frag += "  return vec2((x + 0.5) / sz.x, (y + 0.5) / sz.y);\n"
     frag += "}\n"
 
     # Coordinate decoding - compute logical output indices from flat_id
@@ -1145,7 +1153,15 @@ class GL21Renderer(MGLRenderer):
       frag += "  return vec2((x + 0.5) / sz.x, (y + 0.5) / sz.y);\n"
       frag += "}\n"
       frag += "vec2 _coord_add(float a, float b, vec2 sz) {\n"
-      frag += "  return _coord(a + b, sz);\n"
+      frag += "  float ya = floor((a + 0.1) / sz.x);\n"
+      frag += "  float rema = floor(a - ya * sz.x + 0.1);\n"
+      frag += "  float yb = floor((b + 0.1) / sz.x);\n"
+      frag += "  float remb = floor(b - yb * sz.x + 0.1);\n"
+      frag += "  float rem = rema + remb;\n"
+      frag += "  float yextra = floor((rem + 0.1) / sz.x);\n"
+      frag += "  float y = ya + yb + yextra;\n"
+      frag += "  float x = floor(rem - yextra * sz.x + 0.1);\n"
+      frag += "  return vec2((x + 0.5) / sz.x, (y + 0.5) / sz.y);\n"
       frag += "}\n"
       frag_coord_decls = ["  int _flat_id = int(v_flat_id);"] + coord_decls[1:]
       body = frag_coord_decls + coord_setup + hoist_complex_float(kernel)

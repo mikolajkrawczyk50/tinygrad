@@ -226,10 +226,12 @@ class MGLRenderer(CStyleLanguage):
   nan = "NAN"
   barrier = "barrier();\n  memoryBarrierShared();"
   extra_matcher: PatternMatcher | None = glsl_matcher
-  code_for_op = {**CStyleLanguage.code_for_op, Ops.CMOD: lambda a,b,dtype: f"(({a})-({a})/({b})*({b}))"}
+  code_for_op = {**CStyleLanguage.code_for_op, Ops.CMOD: lambda a,b,dtype: f"(({a})-({a})/({b})*({b}))",
+                 Ops.FDIV: lambda a,b,dtype: f"({a}/{b})"}
 
   string_rewrite = PatternMatcher([
     (UPat(Ops.CONST, dtype=dtypes.bool, name="x"), lambda ctx,x: "true" if x.val else "false"),
+    (UPat.cvar("c").cast(dtypes.bool), lambda ctx,c: "true" if c.val else "false"),
     (UPat(Ops.BITCAST, name="x"), lambda ctx,x: _bitcast(ctx, x)),
     (UPat((Ops.CMPNE, Ops.CMPEQ), src=(UPat.var("a", dtypes.bool), UPat.var("b")), name="x"),
      lambda ctx,a,b,x: f"({ctx[a]}{'!=' if x.op is Ops.CMPNE else '=='}bool({ctx[b]}))"),

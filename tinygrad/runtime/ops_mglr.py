@@ -2,7 +2,7 @@ import os, struct, moderngl
 from typing import Any
 from tinygrad.device import Compiled, Allocator, BufferSpec, Program, TinyELF
 from tinygrad.helpers import round_up, prod
-from tinygrad.renderer.glsl import MGLRasterRenderer, MGLRASTER_MAGIC
+from tinygrad.renderer.glsl_mglr import MGLRasterRenderer, MGLRASTER_MAGIC
 
 class MGLRasterProgram(Program['MGLRDevice']):
   def __init__(self, dev:'MGLRDevice', obj:TinyELF):

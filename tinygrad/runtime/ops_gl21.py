@@ -4,7 +4,7 @@ import moderngl
 import numpy as np
 
 from tinygrad.device import Compiled, Allocator, BufferSpec, Program, TinyELF
-from tinygrad.renderer.glsl import GL21Renderer
+from tinygrad.renderer.glsl_gl21 import GL21Renderer
 from tinygrad.helpers import prod
 from tinygrad.dtype import dtypes
 

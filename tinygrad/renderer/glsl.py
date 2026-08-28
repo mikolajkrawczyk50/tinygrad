@@ -214,7 +214,7 @@ def _render_store(ctx, b, v) -> str:
       return f"atomicAnd({ctx[b]},{ctx[v.src[1]]});"
   return f"{ctx[b]} = {ctx[v]};"
 
-class MGLRenderer(CStyleLanguage):
+class GLRenderer(CStyleLanguage):
   supports_float4 = False
   global_max = (65535, 65535, 65535)
   local_max = (1024, 1024, 64)
@@ -283,7 +283,14 @@ class MGLRenderer(CStyleLanguage):
       prg += "layout(std140, binding=0) uniform UBO { "
       prg += "; ".join(f"{self.type_map.get(u.dtype, u.dtype.name)} {name}" for name,u in alus)
       prg += "; };\n"
-    return prg + "\nvoid main() {\n" + "\n".join(hoist_complex_float(kernel)) + "\n}\n"
+    shared_decls, body = [], []
+    for line in hoist_complex_float(kernel):
+      if line.startswith("shared "): shared_decls.append(line)
+      else: body.append(line)
+    if len(shared_decls): prg += "\n".join(shared_decls) + "\n"
+    return prg + "\nvoid main() {\n" + "\n".join(body) + "\n}\n"
 
   def supported_dtypes(self):
     return {dtypes.float, dtypes.int32, dtypes.uint32, dtypes.bool, dtypes.int8, dtypes.uint8, dtypes.int16, dtypes.uint16}
+
+MGLRenderer = GLRenderer
